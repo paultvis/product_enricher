@@ -1,0 +1,50 @@
+base_url: "http://192.168.0.29"
+
+endpoints:
+  auth: "/api/v1/App/user"
+  product: "/api/v1/Product"
+  seo_product: "/api/v1/SEOProduct"
+  specification: "/api/v1/Specification"
+  specification_value: "/api/v1/SpecificationValue"
+
+queue:
+  host: "192.168.0.28"
+  user: "${ENRICH_DB_USER}"
+  password: "${ENRICH_DB_PASS}"
+  database: "vwr"
+  use_pure: true
+  connection_timeout: 10
+  table: "enrichment_queue"
+  batch_size: 20
+
+fields:
+  product:
+    id: "id"
+    sku: "sku"
+    name: "name"
+    mpn: "mpn"
+    brand: "brandName"
+    base_copy:
+      - "descriptionpromotion"
+      - "vMShortdescription"
+      - "contentHeader"
+      - "longDescription"
+      - "brandDescription"
+      - "contentfooter"
+      - "supplierShortDescription"
+  seo_product:
+    product_id: "productId"
+    ai_fields:
+      aititle: "aititle"
+      aiDesc: "aiDesc"
+      aBrandDesc: "aBrandDesc"
+      metaName: "metaName"
+      metadescription: "metadescription"
+      metakeywords: "metakeywords"
+  spec:
+    name: "name"
+    code: "code"
+  spec_value:
+    value: "value"
+    spec_id: "specificationId"
+    seo_product_id: "sEOProductId"
