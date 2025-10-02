@@ -77,7 +77,7 @@ CR_USER = os.getenv("CRAWLER_DB_USER", "crawler")
 CR_PASS = os.getenv("CRAWLER_DB_PASS", "Albatr0ss22!")
 CR_NAME = os.getenv("CRAWLER_DB_NAME", "vwr")
 
-EN_HOST = os.getenv("ENRICH_DB_HOST", "192.168.0.29")
+EN_HOST = os.getenv("ENRICH_DB_HOST", "192.168.0.28")
 EN_USER = os.getenv("ENRICH_DB_USER", "root")
 EN_PASS = os.getenv("ENRICH_DB_PASS", "Albatr0ss22!")
 EN_NAME = os.getenv("ENRICH_DB_NAME", "vwr")
