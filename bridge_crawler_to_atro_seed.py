@@ -68,18 +68,18 @@ _ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 LOG.addHandler(_ch)
 
 # ---------- ENV ----------
-ATRO_BASE_URL = os.getenv("ATRO_BASE_URL", "").strip().rstrip("/")
-ATRO_USER     = os.getenv("ATRO_USER", "")
-ATRO_PASS     = os.getenv("ATRO_PASS", "")
+ATRO_BASE_URL = os.getenv("ATRO_BASE_URL", "http://192.168.0.29").strip().rstrip("/")
+ATRO_USER     = os.getenv("ATRO_USER", "pault")
+ATRO_PASS     = os.getenv("ATRO_PASS", "Albatr0ss22!")
 
 CR_HOST = os.getenv("CRAWLER_DB_HOST", "127.0.0.1")
-CR_USER = os.getenv("CRAWLER_DB_USER", "")
-CR_PASS = os.getenv("CRAWLER_DB_PASS", "")
-CR_NAME = os.getenv("CRAWLER_DB_NAME", "brand_crawler")
+CR_USER = os.getenv("CRAWLER_DB_USER", "crawler")
+CR_PASS = os.getenv("CRAWLER_DB_PASS", "Albatr0ss22!")
+CR_NAME = os.getenv("CRAWLER_DB_NAME", "vwr")
 
-EN_HOST = os.getenv("ENRICH_DB_HOST", "127.0.0.1")
-EN_USER = os.getenv("ENRICH_DB_USER", "")
-EN_PASS = os.getenv("ENRICH_DB_PASS", "")
+EN_HOST = os.getenv("ENRICH_DB_HOST", "192.168.0.29")
+EN_USER = os.getenv("ENRICH_DB_USER", "root")
+EN_PASS = os.getenv("ENRICH_DB_PASS", "Albatr0ss22!")
 EN_NAME = os.getenv("ENRICH_DB_NAME", "vwr")
 EN_TABLE = os.getenv("ENRICH_DB_TABLE", "enrichment_queue")
 
