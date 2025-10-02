@@ -7,13 +7,14 @@ uploads images and PDFs, patches brand_content/specs, then seeds the enrichment 
 
 Adds SKU resolution:
 - First tries to fetch SKU from enrichment DB using the provided join query.
-- If not found, inserts a row into `sku` (Manufacturer, manpartno, title) to generate a numeric SKU,
+- If not found, inserts a row into `sku` (Manufacturer, manpartno, productname/title/name if present) to generate a numeric SKU,
   and then re-queries to fetch it.
 
 New in this revision:
 - Upload & link locally-downloaded PDFs (from raw_assets, asset_type='document').
 - Simple de-duplication by filename-in-folder for both images and documents.
 - --latest-run flag to process only the most recent run (optionally scoped by --brand).
+- SKU insert now prefers 'productname' column, then 'title', then 'name'.
 
 Environment variables:
 
@@ -50,7 +51,6 @@ Usage:
 import os
 import sys
 import json
-import time
 import logging
 import argparse
 from pathlib import Path
@@ -117,7 +117,6 @@ def ensure_brand(client: AtroClient, brand_name: str) -> Dict[str, Any]:
     if not brand_name:
         raise ValueError("brand_name required")
 
-    # Favor writer.urlencode if available (keeps consistency with your helpers)
     if hasattr(writer, "urlencode"):
         q = "?" + writer.urlencode({
             "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
@@ -319,33 +318,58 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
 
 # ---------- Enrichment DB helpers ----------
 
-def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title: str) -> str:
+def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
     """
-    Resolve SKU via join; if missing, INSERT minimal row and re-query.
+    Resolve SKU via join; if missing, INSERT minimal row into `sku`.
+    We respect your actual schema: prefer 'productname', else 'title', else 'name' if present; otherwise omit.
     """
     cur = cnx.cursor()
-    sql = """
+
+    # 1) Try to resolve first
+    lookup_sql = """
         SELECT b.sku
         FROM supplier_partno_prefix a
         JOIN sku b ON b.Manufacturer = IFNULL(a.brand_name, a.manufacturer)
         WHERE b.manufacturer = %s AND b.manpartno = %s
         GROUP BY b.sku, b.manpartno, b.Manufacturer
     """
-    cur.execute(sql, (manufacturer, mpn))
+    cur.execute(lookup_sql, (manufacturer, mpn))
     r = cur.fetchone()
     if r and r[0]:
         cur.close()
         return str(r[0])
 
-    # create minimal SKU
-    cur.execute(
-        "INSERT INTO sku (Manufacturer, manpartno, title) VALUES (%s, %s, %s)",
-        (manufacturer, mpn, title or mpn)
-    )
+    # 2) Work out available columns on your 'sku' table
+    cols = set(get_table_columns(cnx, cnx.database, "sku"))
+
+    # Always set required fields we know exist in your environment
+    fields = ["Manufacturer", "manpartno"]
+    values = [manufacturer, mpn]
+
+    # Optional: prefer 'productname', then 'title', then 'name'
+    used_opt_col = None
+    if "productname" in cols and title_or_name:
+        fields.append("productname")
+        values.append(title_or_name)
+        used_opt_col = "productname"
+    elif "title" in cols and title_or_name:
+        fields.append("title")
+        values.append(title_or_name)
+        used_opt_col = "title"
+    elif "name" in cols and title_or_name:
+        fields.append("name")
+        values.append(title_or_name)
+        used_opt_col = "name"
+
+    placeholders = ", ".join(["%s"] * len(values))
+    insert_sql = f"INSERT INTO sku ({', '.join(fields)}) VALUES ({placeholders})"
+    cur.execute(insert_sql, tuple(values))
     cnx.commit()
 
-    # re-query
-    cur.execute(sql, (manufacturer, mpn))
+    LOG.info(f"[SKU] inserted minimal row for mpn={mpn}; optional_column_used={used_opt_col or 'none'}")
+
+    # 3) Re-query to get the generated SKU
+    cur.execute(lookup_sql, (manufacturer, mpn))
     r2 = cur.fetchone()
     cur.close()
     return str(r2[0]) if r2 and r2[0] else ""
@@ -482,7 +506,6 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[ATRO] reuse doc :: name={local_pdf.name} id={file_id}")
             else:
                 data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
-                # extension fallback if mime/type missing
                 ext = ext or "pdf"
                 file_meta = client.upload_file(
                     name=local_pdf.name,

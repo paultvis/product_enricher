@@ -43,6 +43,24 @@ class AtroClient:
         r.raise_for_status()
         return r
 
+    @staticmethod
+    def _json_or_empty(r: requests.Response):
+        """
+        Safely return JSON if present, otherwise {}.
+        Handles 204 No Content and non-JSON responses gracefully.
+        """
+        if r.status_code == 204:
+            return {}
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "application/json" not in ct:
+            return {}
+        if not (r.text or "").strip():
+            return {}
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
     # ---- Product
     def get_product_by_sku(self, sku: str, select_fields=None):
         params = {
@@ -85,7 +103,7 @@ class AtroClient:
 
     def patch_seo(self, seo_id: str, payload: dict):
         r = self._request("PATCH", f"/api/v1/SEOProduct/{seo_id}", json=payload)
-        return r.json()
+        return self._json_or_empty(r)
 
     # ---- Specification keys
     def list_specs(self, page_size=200):
@@ -198,5 +216,4 @@ class AtroClient:
     def set_seo_main_image(self, seo_product_id: str, file_id: str):
         payload = {"mainImageId": file_id}
         r = self._request("PATCH", f"/api/v1/SEOProduct/{seo_product_id}", json=payload)
-        return r.json()
-
+        return self._json_or_empty(r)
