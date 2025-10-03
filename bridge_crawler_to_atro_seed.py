@@ -35,6 +35,10 @@ Idempotency & hardening update:
 - Skip unchanged stages based on hashes (no Atro calls when not needed)
 - Name-based dedupe in Atro folder before uploading (images + docs)
 - Upload retries with exponential backoff
+
+New in this version:
+- **Early exit**: if all four hashes match, skip all Atro activity for the SKU
+- **Duplicate-link protection**: prefetch existing SEO→File links, avoid re-link; treat 400 on link as benign
 """
 #----nudge
 import os
@@ -45,11 +49,12 @@ import hashlib
 import logging
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 import mysql.connector
+import requests
 
 from atro_client import AtroClient
 import writer  # ensure_seo_for_product, upsert_specs_and_values, _to_data_url
@@ -628,7 +633,7 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
     cur.close()
 
 
-# ---------- Atro file helpers (dedupe + retries) ----------
+# ---------- Atro file helpers (dedupe + retries + link checks) ----------
 def _find_file_in_folder_by_name(client: AtroClient, folder_id: str, name: str) -> Optional[Dict[str, Any]]:
     """
     Search Atro File by exact name within a folder. Returns the first match or None.
@@ -646,6 +651,30 @@ def _find_file_in_folder_by_name(client: AtroClient, folder_id: str, name: str) 
         return lst[0] if lst else None
     except Exception:
         return None
+
+
+def _get_linked_file_ids_for_seo(client: AtroClient, seo_id: str) -> Set[str]:
+    """
+    Fetch the set of File IDs already linked to the given SEOProduct.
+    """
+    try:
+        from urllib.parse import urlencode
+        q = "?" + urlencode({
+            "maxSize": 200, "offset": 0,
+            "where[0][type]": "equals", "where[0][attribute]": "seoProductId", "where[0][value]": seo_id,
+        })
+        r = client._request("GET", f"/api/v1/SEOProductFile{q}")
+        data = r.json() or {}
+        lst = data.get("list") or []
+        result = set()
+        for it in lst:
+            # records usually contain fileId
+            fid = it.get("fileId")
+            if fid:
+                result.add(fid)
+        return result
+    except Exception:
+        return set()
 
 
 def _upload_with_retries(client: AtroClient, *, name: str, folder_id: str,
@@ -669,6 +698,25 @@ def _upload_with_retries(client: AtroClient, *, name: str, folder_id: str,
             LOG.warning(f"[ATRO] upload retry {attempt+1}/{max_retries} in {sleep_for}s :: name={name} err={e}")
             time.sleep(sleep_for)
             attempt += 1
+
+
+def _safe_link_file_to_seo(client: AtroClient, seo_id: str, file_id: str, already_linked: Set[str]):
+    """
+    Link file to SEO unless already linked.
+    Treat HTTP 400 as 'already linked' and continue.
+    """
+    if file_id in already_linked:
+        return
+    try:
+        client.link_file_to_seo(seo_id, file_id)
+        already_linked.add(file_id)
+    except requests.HTTPError as e:
+        # If server says bad request, assume duplicate relation and continue
+        if e.response is not None and e.response.status_code == 400:
+            LOG.info(f"[ATRO] link already exists (400), skipping :: seo={seo_id} file={file_id}")
+            already_linked.add(file_id)
+        else:
+            raise
 
 
 # ---------- Core processing ----------
@@ -725,7 +773,22 @@ def process_one(
     do_imgs  = (images_hash is not None) and (images_hash != prog.get("images_hash"))
     do_docs  = (docs_hash is not None) and (docs_hash != prog.get("docs_hash"))
 
-    # --- Patch brand content from crawler into SEOProduct.brandcontent ---
+    # ---------- Early exit: if all parts unchanged, skip all Atro work ----------
+    if not (do_brand or do_specs or do_imgs or do_docs):
+        LOG.info(f"[SKIP] all unchanged :: sku={sku_for_queue}")
+        # still ensure the queue row exists
+        enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
+        # refresh progress row (keeps timestamps moving forward if desired)
+        upsert_progress(
+            enrich_cnx, sku_for_queue, brand, mpn,
+            brand_html_hash=brand_html_hash,
+            specs_hash=specs_hash,
+            images_hash=images_hash,
+            docs_hash=docs_hash
+        )
+        return
+
+    # --- Patch brand content ---
     if do_brand:
         client.patch_seo(seo["id"], {"brandcontent": current_brand_html})
         LOG.info(f"[ATRO] SEO patch brandcontent :: seo={seo['id']} bytes={len(current_brand_html)}")
@@ -739,6 +802,9 @@ def process_one(
         LOG.info(f"[ATRO] Specs upserted :: n={len(current_specs)}")
     elif current_specs:
         LOG.info(f"[SKIP] specs unchanged :: sku={sku_for_queue}")
+
+    # Prepare linked set to avoid duplicate linking
+    linked_ids: Set[str] = _get_linked_file_ids_for_seo(client, seo["id"])
 
     # --- Sync images (upload local jpgs, link, set main) ---
     uploaded_file_id_for_primary: Optional[str] = None
@@ -785,7 +851,9 @@ def process_one(
                         if upload_sem:
                             upload_sem.release()
 
-                client.link_file_to_seo(seo["id"], file_meta["id"])
+                # link file if not already linked
+                _safe_link_file_to_seo(client, seo["id"], file_meta["id"], linked_ids)
+
                 if url == primary_url and not uploaded_file_id_for_primary:
                     uploaded_file_id_for_primary = file_meta["id"]
 
@@ -832,7 +900,8 @@ def process_one(
                         if upload_sem:
                             upload_sem.release()
 
-                client.link_file_to_seo(seo["id"], file_meta["id"])
+                # link file if not already linked
+                _safe_link_file_to_seo(client, seo["id"], file_meta["id"], linked_ids)
                 linked_docs += 1
 
             LOG.info(f"[ATRO] documents linked :: seo={seo['id']} n={linked_docs}")
