@@ -14,31 +14,37 @@ class AtroClient:
         self._lock = threading.Lock()
 
     def _auth(self):
-        creds = f"{self.user}:{self.password}".encode("iso-8859-1")
-        headers = {
-            "Accept": "application/json",
-            "Authorization": "Basic " + base64.b64encode(creds).decode("ascii"),
-            "Authorization-Token-Only": "true",
-            "Authorization-Token-Lifetime": "0",
-            "Authorization-Token-Idletime": "0",
-        }
-        r = requests.get(f"{self.base_url}/api/v1/App/user", headers=headers, timeout=self.timeout)
-        r.raise_for_status()
-        self._token = r.json()["authorizationToken"]
+        with self._lock:
+            if self._token:
+                return self._token
+            url = f"{self.base_url}/api/v1/App/user-identity"
+            r = requests.post(
+                url,
+                json={"userName": self.user, "password": self.password},
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+            self._token = data.get("token")
+            if not self._token:
+                raise RuntimeError("Failed to obtain auth token.")
+            return self._token
 
     def _headers(self):
-        if not self._token:
-            with self._lock:
-                if not self._token:
-                    self._auth()
-        return {"Accept": "application/json", "Authorization": f"Bearer {self._token}"}
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Auth-Token": self._auth(),
+        }
 
-    def _request(self, method, path, **kwargs):
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
+        # First attempt
         r = requests.request(method, url, headers=self._headers(), timeout=self.timeout, **kwargs)
         if r.status_code == 401:
+            # Token may have expired; refresh once
             with self._lock:
-                self._auth()
+                self._token = None
             r = requests.request(method, url, headers=self._headers(), timeout=self.timeout, **kwargs)
         r.raise_for_status()
         return r
@@ -74,12 +80,34 @@ class AtroClient:
         q = "?" + urlencode(params)
         r = self._request("GET", f"/api/v1/Product{q}")
         data = r.json()
-        return (data.get("list") or [None])[0]
+        lst = data.get("list") or []
+        return lst[0] if lst else None
 
-    def get_product_by_id(self, product_id: str, select_fields=None):
-        sel = f"?select={','.join(select_fields)}" if select_fields else ""
-        r = self._request("GET", f"/api/v1/Product/{product_id}{sel}")
+    def get_product_by_brand_mpn(self, brand: str, mpn: str, select_fields=None):
+        params = {
+            "maxSize": 50, "offset": 0, "sortBy": "createdAt", "asc": "false",
+            "where[0][type]": "equals",
+            "where[0][attribute]": "brand",
+            "where[0][value]": brand,
+            "where[1][type]": "equals",
+            "where[1][attribute]": "mpn",
+            "where[1][value]": mpn,
+        }
+        if select_fields:
+            params["select"] = ",".join(select_fields)
+        q = "?" + urlencode(params)
+        r = self._request("GET", f"/api/v1/Product{q}")
+        data = r.json()
+        lst = data.get("list") or []
+        return lst[0] if lst else None
+
+    def create_product(self, payload: dict):
+        r = self._request("POST", "/api/v1/Product", json=payload)
         return r.json()
+
+    def patch_product(self, product_id: str, payload: dict):
+        r = self._request("PATCH", f"/api/v1/Product/{product_id}", json=payload)
+        return self._json_or_empty(r)
 
     # ---- SEOProduct
     def find_seo_by_product(self, product_id: str, select_fields=None):
@@ -115,11 +143,13 @@ class AtroClient:
             q = "?" + urlencode(params)
             r = self._request("GET", f"/api/v1/Specification{q}")
             data = r.json()
-            for item in data.get("list", []):
-                nm = (item.get("name") or "").strip()
-                if nm:
-                    out[nm.lower()] = item
-            if len(data.get("list", [])) < page_size:
+            lst = data.get("list") or []
+            for it in lst:
+                nm = (it.get("name") or "").strip()
+                if not nm:
+                    continue
+                out[nm.lower()] = {"id": it.get("id"), "name": nm, "code": it.get("code")}
+            if len(lst) < page_size:
                 break
             offset += page_size
         return out
@@ -129,31 +159,15 @@ class AtroClient:
         r = self._request("POST", "/api/v1/Specification", json=payload)
         return r.json()
 
-    # ---- Specification value (link to SEOProduct)
     def create_spec_value(self, specification_id: str, seo_product_id: str, value: str):
         payload = {"specificationId": specification_id, "sEOProductId": seo_product_id, "value": value}
         r = self._request("POST", "/api/v1/SpecificationValue", json=payload)
         return r.json()
-        
-    # ---- Product by MPN
-    def get_product_by_mpn(self, mpn: str, select_fields=None):
-        params = {
-            "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
-            "where[0][type]": "equals",
-            "where[0][attribute]": "mpn",
-            "where[0][value]": mpn
-        }
-        if select_fields:
-            params["select"] = ",".join(select_fields)
-        q = "?" + urlencode(params)
-        r = self._request("GET", f"/api/v1/Product{q}")
-        data = r.json()
-        return (data.get("list") or [None])[0]
 
-    # ---- Folder lookup
+    # ---- Folders & Files
     def find_folder_by_name(self, name: str):
         params = {
-            "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
+            "maxSize": 50, "offset": 0, "sortBy": "createdAt", "asc": "false",
             "where[0][type]": "equals",
             "where[0][attribute]": "name",
             "where[0][value]": name
@@ -164,12 +178,15 @@ class AtroClient:
         lst = data.get("list") or []
         return lst[0] if lst else None
 
-    # Optional: avoid dup uploads by name within a folder
     def find_file_by_name_in_folder(self, name: str, folder_id: str):
         params = {
             "maxSize": 50, "offset": 0, "sortBy": "createdAt", "asc": "false",
-            "where[0][type]": "equals", "where[0][attribute]": "name", "where[0][value]": name,
-            "where[1][type]": "equals", "where[1][attribute]": "folderId", "where[1][value]": folder_id,
+            "where[0][type]": "equals",
+            "where[0][attribute]": "name",
+            "where[0][value]": name,
+            "where[1][type]": "equals",
+            "where[1][attribute]": "folderId",
+            "where[1][value]": folder_id
         }
         q = "?" + urlencode(params)
         r = self._request("GET", f"/api/v1/File{q}")
@@ -177,32 +194,17 @@ class AtroClient:
         lst = data.get("list") or []
         return lst[0] if lst else None
 
-    # ---- File upload
-    def upload_file(
-        self,
-        *,
-        name: str,
-        folder_id: str,
-        data_url: str,
-        file_size: int | None = None,
-        mime_type: str | None = None,
-        extension: str | None = None,
-        hidden: bool = False,
-        tags: str | None = None,
-    ):
+    def upload_file(self, name: str, folder_id: str, data_url: str, file_size: int, mime_type: str, extension: str, hidden: bool = False):
         payload = {
             "name": name,
-            "hidden": bool(hidden),
             "folderId": folder_id,
-            "typeId": "file",                     # per your note: always 'file'
-            "fileContents": data_url,            # data:<mime>;base64,<...>
+            "type": mime_type,
+            "size": file_size,
+            "extension": extension,
+            "hidden": hidden,
+            "source": "upload",
+            "data": data_url,
         }
-        if file_size is not None: payload["fileSize"] = int(file_size)
-        if mime_type: payload["mimeType"] = mime_type
-        if extension: payload["extension"] = extension.lstrip(".").lower()
-        if tags: payload["tags"] = tags
-
-        # Atro supports ?silent=true on create as you shared
         r = self._request("POST", "/api/v1/File?silent=true", json=payload)
         return r.json()
 

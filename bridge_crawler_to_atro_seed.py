@@ -3,51 +3,17 @@
 bridge_crawler_to_atro_seed.py
 
 Bridges crawler outputs (raw_products/raw_assets) → AtroPIM (Product/SEOProduct),
-uploads images and PDFs, patches brand_content/specs, then seeds the enrichment queue with SKUs.
+uploads images and PDFs, patches brand content/specs, then seeds the enrichment queue with SKUs.
 
-Adds SKU resolution:
-- First tries to fetch SKU from enrichment DB using the provided join query.
-- If not found, inserts a row into `sku` (Manufacturer, manpartno, productname/title/name if present) to generate a numeric SKU,
-  and then re-queries to fetch it.
-
-New in this revision:
-- Upload & link locally-downloaded PDFs (from raw_assets, asset_type='document').
-- Simple de-duplication by filename-in-folder for both images and documents.
-- --latest-run flag to process only the most recent run (optionally scoped by --brand).
-- SKU insert now prefers 'productname' column, then 'title', then 'name'.
-
-Environment variables:
-
-# Atro
-ATRO_BASE_URL       - e.g. https://atro.example.com
-ATRO_USER           - AtroPIM user
-ATRO_PASS           - AtroPIM password
-
-# Crawler DB (MySQL 8+)
-CRAWLER_DB_HOST
-CRAWLER_DB_USER
-CRAWLER_DB_PASS
-CRAWLER_DB_NAME     - database name containing raw_products/raw_assets
-
-# Enrichment DB (queue target + sku table)
-ENRICH_DB_HOST
-ENRICH_DB_USER
-ENRICH_DB_PASS
-ENRICH_DB_NAME
-ENRICH_DB_TABLE     - (default: enrichment_queue)
-
-Other:
-BATCH_LIMIT         - optional int; process at most this many (brand,mpn) rows
-ASSET_ROOT          - defaults to '/opt/brand_crawler/data/assets' if local paths are relative
-
-Usage:
-  python bridge_crawler_to_atro_seed.py --since-run-id 0
-  python bridge_crawler_to_atro_seed.py --all
-  python bridge_crawler_to_atro_seed.py --latest-run
-  python bridge_crawler_to_atro_seed.py --latest-run --brand "Humminbird"
-  python bridge_crawler_to_atro_seed.py --brand "Humminbird" --limit 200
+This version:
+- Seeds SEOProduct base fields from Product on first create:
+  Product.shortdescription2  -> SEOProduct.vMShortdescription
+  Product.longDescription    -> SEOProduct.longDescription
+- Writes crawler HTML into SEOProduct.brandcontent (aligns with enricher input).
+- Defaults to --latest-run when no mode flag is provided.
+- Enqueues to enrichment_queue with brand_name when that column exists, and backfills brand_name on existing rows.
 """
-
+#----nudge
 import os
 import sys
 import json
@@ -59,7 +25,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import mysql.connector
 
 from atro_client import AtroClient
-import writer  # uses your existing helpers: ensure_seo_for_product, upsert_specs_and_values, _to_data_url
+import writer  # ensure_seo_for_product, upsert_specs_and_values, _to_data_url
 
 LOG = logging.getLogger("bridge")
 LOG.setLevel(logging.INFO)
@@ -87,6 +53,13 @@ ASSET_ROOT = os.getenv("ASSET_ROOT", "/opt/brand_crawler/data/assets")
 BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "0"))  # 0 = unlimited
 
 
+# --- Product → SEOProduct base field mapping (seed on SEO creation only) ---
+PRODUCT_TO_SEO_FIELD_MAP = {
+    "shortdescription2": "vMShortdescription",
+    "longDescription":   "longDescription",
+}
+
+
 def _mysql_connect(host, user, password, database):
     return mysql.connector.connect(
         host=host, user=user, password=password, database=database,
@@ -110,10 +83,8 @@ def get_table_columns(cnx, table_schema: str, table_name: str) -> List[str]:
     return cols
 
 
-# ---------- Atro helpers using your AtroClient ----------
-
+# ---------- Atro helpers ----------
 def ensure_brand(client: AtroClient, brand_name: str) -> Dict[str, Any]:
-    """Find existing Brand by name or create it."""
     if not brand_name:
         raise ValueError("brand_name required")
 
@@ -167,28 +138,35 @@ def ensure_product_by_mpn(
         r = client._request("POST", "/api/v1/Product", json=payload)
         prod = r.json()
     else:
-        # ensure SKU if missing
         desired_sku = (sku_preferred or prod.get("sku") or "").strip()
         if not (prod.get("sku") or "").strip() and desired_sku:
             LOG.info(f"[ATRO] Patch Product (set sku) :: id={prod['id']} sku={desired_sku}")
             client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"sku": desired_sku})
             prod["sku"] = desired_sku
-        # ensure brandId if missing
         if not prod.get("brandId") and brand and brand.get("id"):
             client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"brandId": brand["id"]})
             prod["brandId"] = brand["id"]
     return prod
 
 
-def ensure_seo_for_product(client: AtroClient, product: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure SEOProduct exists (uses your writer helper)."""
-    cache: Dict[str, str] = {}
-    seo, _created = writer.ensure_seo_for_product(client, product, cache)
-    return seo
+def ensure_seo_for_product_seeded(client: AtroClient, product: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """
+    Ensure SEOProduct exists. On creation, copy selected base fields from Product into SEOProduct
+    using PRODUCT_TO_SEO_FIELD_MAP.
+    """
+    needed = set(PRODUCT_TO_SEO_FIELD_MAP.keys())
+    if not needed.issubset(set(product.keys())):
+        select = ["id", "name"] + list(needed)
+        prod_full = client.get_product_by_id(product["id"], select_fields=select)
+        product = {**product, **{k: prod_full.get(k) for k in needed}}
+
+    seo, created = writer.ensure_seo_for_product(client, product, PRODUCT_TO_SEO_FIELD_MAP)  # copies only on create
+    if created:
+        LOG.info(f"[ATRO] SEOProduct created and seeded from Product base fields :: seo={seo.get('id')}")
+    return seo, created
 
 
 def ensure_folder(client: AtroClient, name: str = "SEO Uploads") -> Dict[str, Any]:
-    """Find or create a folder to store uploaded files."""
     f = client.find_folder_by_name(name)
     if f:
         return f
@@ -197,17 +175,11 @@ def ensure_folder(client: AtroClient, name: str = "SEO Uploads") -> Dict[str, An
 
 
 # ---------- Crawler DB access ----------
-
 def fetch_latest_crawler_rows(cnx, brand_filter: Optional[str], since_run_id: Optional[int], limit: int) -> List[Dict[str, Any]]:
-    """
-    Get latest row per (brand, mpn) from raw_products. Only rows with non-empty MPN.
-    When since_run_id is provided, restrict to run_id >= since_run_id.
-    """
     cur = cnx.cursor(dictionary=True)
 
     where = ["part_number IS NOT NULL", "part_number <> ''"]
     params: List[Any] = []
-
     if brand_filter:
         where.append("brand = %s")
         params.append(brand_filter)
@@ -238,9 +210,6 @@ def fetch_latest_crawler_rows(cnx, brand_filter: Optional[str], since_run_id: Op
 
 
 def fetch_rows_for_exact_run(cnx, run_id: int, brand_filter: Optional[str], limit: int) -> List[Dict[str, Any]]:
-    """
-    Get latest row per (brand, mpn) but restricted to a specific run_id.
-    """
     cur = cnx.cursor(dictionary=True)
     where = ["part_number IS NOT NULL", "part_number <> ''", "run_id = %s"]
     params: List[Any] = [int(run_id)]
@@ -269,9 +238,6 @@ def fetch_rows_for_exact_run(cnx, run_id: int, brand_filter: Optional[str], limi
 
 
 def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
-    """
-    Prefer a local .jpg sibling for the given URL; fall back to the largest image for that URL.
-    """
     cur = cnx.cursor()
     cur.execute(
         """
@@ -287,16 +253,11 @@ def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
     cur.close()
     if not row:
         return None
-    local_path = row[0]
-    p = Path(local_path)
+    p = Path(row[0])
     return p if p.exists() else None
 
 
 def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
-    """
-    Find a local PDF for the given URL from raw_assets (asset_type='document').
-    Prefer the largest by bytes.
-    """
     cur = cnx.cursor()
     cur.execute(
         """
@@ -317,15 +278,9 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
 
 
 # ---------- Enrichment DB helpers ----------
-
 def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
-    """
-    Resolve SKU via join; if missing, INSERT minimal row into `sku`.
-    We respect your actual schema: prefer 'productname', else 'title', else 'name' if present; otherwise omit.
-    """
     cur = cnx.cursor()
 
-    # 1) Try to resolve first
     lookup_sql = """
         SELECT b.sku
         FROM supplier_partno_prefix a
@@ -339,54 +294,66 @@ def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) 
         cur.close()
         return str(r[0])
 
-    # 2) Work out available columns on your 'sku' table
     cols = set(get_table_columns(cnx, cnx.database, "sku"))
-
-    # Always set required fields we know exist in your environment
     fields = ["Manufacturer", "manpartno"]
     values = [manufacturer, mpn]
 
-    # Optional: prefer 'productname', then 'title', then 'name'
     used_opt_col = None
     if "productname" in cols and title_or_name:
-        fields.append("productname")
-        values.append(title_or_name)
-        used_opt_col = "productname"
+        fields.append("productname"); values.append(title_or_name); used_opt_col = "productname"
     elif "title" in cols and title_or_name:
-        fields.append("title")
-        values.append(title_or_name)
-        used_opt_col = "title"
+        fields.append("title"); values.append(title_or_name); used_opt_col = "title"
     elif "name" in cols and title_or_name:
-        fields.append("name")
-        values.append(title_or_name)
-        used_opt_col = "name"
+        fields.append("name"); values.append(title_or_name); used_opt_col = "name"
 
     placeholders = ", ".join(["%s"] * len(values))
     insert_sql = f"INSERT INTO sku ({', '.join(fields)}) VALUES ({placeholders})"
     cur.execute(insert_sql, tuple(values))
     cnx.commit()
-
     LOG.info(f"[SKU] inserted minimal row for mpn={mpn}; optional_column_used={used_opt_col or 'none'}")
 
-    # 3) Re-query to get the generated SKU
     cur.execute(lookup_sql, (manufacturer, mpn))
     r2 = cur.fetchone()
     cur.close()
     return str(r2[0]) if r2 and r2[0] else ""
 
 
-def enqueue_sku(cnx, sku: str, source: str = "crawler"):
+def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler"):
+    """
+    Insert a pending queue row with brand_name if the column exists.
+    If the row already exists (INSERT IGNORE), backfill brand_name via UPDATE.
+    """
+    cols = set(get_table_columns(cnx, cnx.database, EN_TABLE))
     cur = cnx.cursor()
-    cur.execute(
-        f"INSERT IGNORE INTO {EN_TABLE} (sku, status, content_source) VALUES (%s, 'pending', %s)",
-        (sku, source)
-    )
-    cnx.commit()
+
+    if "brand_name" in cols:
+        # Try insert with brand_name
+        cur.execute(
+            f"INSERT IGNORE INTO {EN_TABLE} (sku, brand_name, status, content_source) "
+            f"VALUES (%s, %s, 'pending', %s)",
+            (sku, brand_name or "", source)
+        )
+        cnx.commit()
+        # Backfill brand_name if the row already existed
+        cur.execute(
+            f"UPDATE {EN_TABLE} SET brand_name = %s "
+            f"WHERE sku = %s AND (brand_name IS NULL OR brand_name = '')",
+            (brand_name or "", sku)
+        )
+        cnx.commit()
+    else:
+        # Legacy table without brand_name
+        cur.execute(
+            f"INSERT IGNORE INTO {EN_TABLE} (sku, status, content_source) "
+            f"VALUES (%s, 'pending', %s)",
+            (sku, source)
+        )
+        cnx.commit()
+
     cur.close()
 
 
 # ---------- Core processing ----------
-
 def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row: Dict[str, Any]):
     brand = (row.get("brand") or "").strip()
     mpn = (row.get("part_number") or "").strip()
@@ -396,25 +363,20 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
     # Ensure Brand
     brand_obj = ensure_brand(client, brand)
 
-    # Resolve SKU in enrichment DB
+    # Resolve SKU
     sku_for_queue = resolve_or_create_sku(enrich_cnx, brand, mpn, name or mpn)
 
     # Ensure Product
     product = ensure_product_by_mpn(client, brand_obj, mpn, name, sku_for_queue)
 
-    # Ensure SEOProduct
-    seo = ensure_seo_for_product(client, product)
+    # Ensure SEOProduct (seed with Product short/long on first create)
+    seo, created = ensure_seo_for_product_seeded(client, product)
 
-    # --- Patch SEO.brand_content (HTML description) ---
+    # --- Patch brand content from crawler into SEOProduct.brandcontent ---
     brand_html = (row.get("description") or "").strip()
-    patch_payload = {}
     if brand_html:
-        # field name confirmed: brand_content on SEOProduct
-        patch_payload["brand_content"] = brand_html
-
-    if patch_payload:
-        client.patch_seo(seo["id"], patch_payload)
-        LOG.info(f"[ATRO] SEO patch brand_content :: seo={seo['id']} bytes={len(brand_html)}")
+        client.patch_seo(seo["id"], {"brandcontent": brand_html})
+        LOG.info(f"[ATRO] SEO patch brandcontent :: seo={seo['id']} bytes={len(brand_html)}")
 
     # --- Sync specs ---
     specs = {}
@@ -436,7 +398,6 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
 
     uploaded_file_id_for_primary: Optional[str] = None
     if imgs:
-        # choose primary from flag if present, else first
         primary_url = None
         for it in imgs:
             if it and it.get("primary"):
@@ -454,29 +415,20 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[IMG] No local jpg found for url={url}")
                 continue
 
-            # de-dupe by name in folder
-            existing = client.find_file_by_name_in_folder(local_jpg.name, folder_id)
-            if existing:
-                file_id = existing["id"]
-                LOG.info(f"[ATRO] reuse image :: name={local_jpg.name} id={file_id}")
-            else:
-                data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
-                file_meta = client.upload_file(
-                    name=local_jpg.name,
-                    folder_id=folder_id,
-                    data_url=data_url,
-                    file_size=size,
-                    mime_type=mime,
-                    extension="jpg",
-                    hidden=False,
-                    tags=f"bridge,crawler,{brand}"
-                )
-                file_id = file_meta["id"]
-                LOG.info(f"[ATRO] image uploaded :: id={file_id} name={local_jpg.name}")
-
-            client.link_file_to_seo(seo["id"], file_id)
+            data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
+            file_meta = client.upload_file(
+                name=local_jpg.name,
+                folder_id=folder_id,
+                data_url=data_url,
+                file_size=size,
+                mime_type=mime,
+                extension="jpg",
+                hidden=False,
+                tags=f"bridge,crawler,{brand}"
+            )
+            client.link_file_to_seo(seo["id"], file_meta["id"])
             if url == primary_url and not uploaded_file_id_for_primary:
-                uploaded_file_id_for_primary = file_id
+                uploaded_file_id_for_primary = file_meta["id"]
 
         if uploaded_file_id_for_primary:
             client.set_seo_main_image(seo["id"], uploaded_file_id_for_primary)
@@ -488,7 +440,6 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
         docs = json.loads(row.get("docs_json") or "[]") or []
     except Exception:
         docs = []
-
     if docs:
         linked_docs = 0
         for it in docs:
@@ -500,34 +451,25 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[DOC] No local pdf found for url={url}")
                 continue
 
-            existing = client.find_file_by_name_in_folder(local_pdf.name, folder_id)
-            if existing:
-                file_id = existing["id"]
-                LOG.info(f"[ATRO] reuse doc :: name={local_pdf.name} id={file_id}")
-            else:
-                data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
-                ext = ext or "pdf"
-                file_meta = client.upload_file(
-                    name=local_pdf.name,
-                    folder_id=folder_id,
-                    data_url=data_url,
-                    file_size=size,
-                    mime_type=mime or "application/pdf",
-                    extension=ext,
-                    hidden=False,
-                    tags=f"bridge,crawler,{brand}"
-                )
-                file_id = file_meta["id"]
-                LOG.info(f"[ATRO] doc uploaded :: id={file_id} name={local_pdf.name}")
-
-            client.link_file_to_seo(seo["id"], file_id)
+            data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
+            file_meta = client.upload_file(
+                name=local_pdf.name,
+                folder_id=folder_id,
+                data_url=data_url,
+                file_size=size,
+                mime_type=mime or "application/pdf",
+                extension=ext or "pdf",
+                hidden=False,
+                tags=f"bridge,crawler,{brand}"
+            )
+            client.link_file_to_seo(seo["id"], file_meta["id"])
             linked_docs += 1
 
         LOG.info(f"[ATRO] documents linked :: seo={seo['id']} n={linked_docs}")
 
-    # --- Enqueue SKU for the existing enricher ---
-    enqueue_sku(enrich_cnx, sku_for_queue, source="crawler")
-    LOG.info(f"[QUEUE] seeded :: sku={sku_for_queue} source=crawler")
+    # --- Enqueue SKU for the enricher (now includes brand_name when available) ---
+    enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
+    LOG.info(f"[QUEUE] seeded :: sku={sku_for_queue} brand={brand} source=crawler")
 
 
 def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
@@ -543,13 +485,17 @@ def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
 
 def main():
     ap = argparse.ArgumentParser()
-    group = ap.add_mutually_exclusive_group(required=True)
-    group.add_argument("--since-run-id", type=int, help="Process rows with run_id >= this value")
-    group.add_argument("--all", action="store_true", help="Process all latest per (brand, mpn)")
-    group.add_argument("--latest-run", action="store_true", help="Process only rows from the most recent run_id (optionally per --brand)")
+    ap.add_argument("--since-run-id", type=int, default=None, help="Process rows with run_id >= this value")
+    ap.add_argument("--all", action="store_true", help="Process all latest per (brand, mpn)")
+    ap.add_argument("--latest-run", action="store_true", help="Process only rows from the most recent run_id (optionally per --brand)")
     ap.add_argument("--brand", type=str, default=None, help="Restrict to brand name")
     ap.add_argument("--limit", type=int, default=0, help="Max rows to process (0 = no limit)")
     args = ap.parse_args()
+
+    # Default to --latest-run if no mode is set
+    if args.since_run_id is None and not args.all and not args.latest_run:
+        args.latest_run = True
+        LOG.info("No mode flag provided; defaulting to --latest-run")
 
     if not ATRO_BASE_URL or not ATRO_USER or not ATRO_PASS:
         LOG.error("ATRO_BASE_URL / ATRO_USER / ATRO_PASS must be set in env.")
@@ -560,14 +506,11 @@ def main():
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
 
-    # Ensure upload folder (kept as 'SEO Uploads' per your current convention)
     folder = ensure_folder(client, "SEO Uploads")
     folder_id = folder["id"]
 
     limit = args.limit or BATCH_LIMIT or 0
 
-    # Row selection logic
-    rows: List[Dict[str, Any]] = []
     if args.latest_run:
         rid = _latest_run_id(cr_cnx, args.brand)
         if rid is None:
@@ -577,9 +520,12 @@ def main():
             return 0
         LOG.info(f"Selected latest run_id={rid} (brand={args.brand or 'ALL'})")
         rows = fetch_rows_for_exact_run(cr_cnx, rid, brand_filter=args.brand, limit=limit)
+    elif args.since_run_id is not None:
+        LOG.info(f"Selected rows since run_id >= {args.since_run_id} (brand={args.brand or 'ALL'})")
+        rows = fetch_latest_crawler_rows(cr_cnx, brand_filter=args.brand, since_run_id=args.since_run_id, limit=limit)
     else:
-        since_run = args.since_run_id if args.since_run_id and args.since_run_id > 0 else None
-        rows = fetch_latest_crawler_rows(cr_cnx, brand_filter=args.brand, since_run_id=since_run, limit=limit)
+        LOG.info(f"Selected ALL latest per (brand, mpn) (brand filter={args.brand or 'ALL'})")
+        rows = fetch_latest_crawler_rows(cr_cnx, brand_filter=args.brand, since_run_id=None, limit=limit)
 
     LOG.info(f"Selected {len(rows)} (brand,mpn) rows from crawler for bridging")
 
