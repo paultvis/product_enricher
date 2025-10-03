@@ -12,6 +12,14 @@ This version:
 - Writes crawler HTML into SEOProduct.brandcontent (aligns with enricher input).
 - Defaults to --latest-run when no mode flag is provided.
 - Enqueues to enrichment_queue with brand_name when that column exists, and backfills brand_name on existing rows.
+
+Updates in this revision:
+- Use pretty sibling names for uploads (images + PDFs).
+- More robust asset lookup by URL:
+  * exact URL
+  * URL with query/hash stripped
+  * path-based LIKE fallback (for Widen/CDNs)
+- Upload assets to the **Product Images** folder (not “SEO Uploads”).
 """
 #----nudge
 import os
@@ -166,7 +174,7 @@ def ensure_seo_for_product_seeded(client: AtroClient, product: Dict[str, Any]) -
     return seo, created
 
 
-def ensure_folder(client: AtroClient, name: str = "SEO Uploads") -> Dict[str, Any]:
+def ensure_folder(client: AtroClient, name: str = "Product Images") -> Dict[str, Any]:
     f = client.find_folder_by_name(name)
     if f:
         return f
@@ -237,8 +245,20 @@ def fetch_rows_for_exact_run(cnx, run_id: int, brand_filter: Optional[str], limi
     return rows
 
 
+# >>> NEW: small URL normaliser (strip query & hash) for asset lookups
+def _strip_query_hash(u: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(u)
+        p2 = p._replace(query="", fragment="")
+        return urlunparse(p2)
+    except Exception:
+        return u
+
+
 def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
     cur = cnx.cursor()
+    # 1) exact match
     cur.execute(
         """
         SELECT local_path, bytes
@@ -250,6 +270,21 @@ def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
         (url,)
     )
     row = cur.fetchone()
+    if not row:
+        # 2) fallback: stripped query/hash
+        url2 = _strip_query_hash(url)
+        cur.execute(
+            """
+            SELECT local_path, bytes
+            FROM raw_assets
+            WHERE url = %s AND asset_type = 'image' AND local_path IS NOT NULL AND local_path <> ''
+            ORDER BY (CASE WHEN LOWER(local_path) LIKE '%%.jpg' THEN 0 ELSE 1 END), bytes DESC
+            LIMIT 1
+            """,
+            (url2,)
+        )
+        row = cur.fetchone()
+
     cur.close()
     if not row:
         return None
@@ -259,6 +294,8 @@ def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
 
 def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
     cur = cnx.cursor()
+
+    # 1) exact match
     cur.execute(
         """
         SELECT local_path, bytes
@@ -270,6 +307,45 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
         (url,)
     )
     row = cur.fetchone()
+
+    if not row:
+        # 2) fallback: stripped query/hash
+        url2 = _strip_query_hash(url)
+        cur.execute(
+            """
+            SELECT local_path, bytes
+            FROM raw_assets
+            WHERE url = %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
+            ORDER BY bytes DESC
+            LIMIT 1
+            """,
+            (url2,)
+        )
+        row = cur.fetchone()
+
+    if not row:
+        # 3) last resort: path-based LIKE (helps with minor host/query variants, especially Widen)
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(url)
+            # e.g. '/content/xyz/pdf/file.pdf' → look for '%/content/xyz/pdf/file.pdf'
+            suffix = (p.path or "").strip()
+            if suffix:
+                like = f"%{suffix}"
+                cur.execute(
+                    """
+                    SELECT local_path, bytes
+                    FROM raw_assets
+                    WHERE url LIKE %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
+                    ORDER BY bytes DESC
+                    LIMIT 1
+                    """,
+                    (like,)
+                )
+                row = cur.fetchone()
+        except Exception:
+            pass
+
     cur.close()
     if not row:
         return None
@@ -277,8 +353,7 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-# ---------- Pretty upload name helpers (NEW) ----------
-# >>> NEW helper: derive a human-friendly upload name using the pretty sibling (<sha>__original.ext)
+# ---------- Pretty upload name helpers ----------
 def _safe_base_name_from_url(u: Optional[str], fallback: str = "file") -> str:
     try:
         if not u:
@@ -299,7 +374,7 @@ def _safe_base_name_from_url(u: Optional[str], fallback: str = "file") -> str:
 def _force_ext(name: str, forced_ext: Optional[str]) -> str:
     if not forced_ext:
         return name
-    # strip existing trailing image/doc chain like ".webp.jpg" → keep stem
+    # strip existing trailing image/doc chain and force ext
     import re as _re
     stem = _re.sub(r"\.(webp|avif|jpe?g|png|gif|bmp|tiff|pdf)+$", "", name, flags=_re.I)
     return f"{stem}.{forced_ext.lower()}"
@@ -313,9 +388,7 @@ def _compute_upload_name(local_path: Path, forced_ext: Optional[str], original_u
     """
     try:
         sha = local_path.name  # hashed filename used by crawler storage
-        # look for a sibling "<sha>__*"
         parent = local_path.parent
-        # only scan limited entries for speed; directory contains few files
         for entry in parent.iterdir():
             n = entry.name
             if n.startswith(f"{sha}__"):
@@ -324,7 +397,6 @@ def _compute_upload_name(local_path: Path, forced_ext: Optional[str], original_u
     except Exception:
         pass
 
-    # fallback from URL
     derived = _safe_base_name_from_url(original_url, fallback=local_path.name)
     return _force_ext(derived, forced_ext)
 
@@ -379,14 +451,12 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
     cur = cnx.cursor()
 
     if "brand_name" in cols:
-        # Try insert with brand_name
         cur.execute(
             f"INSERT IGNORE INTO {EN_TABLE} (sku, brand_name, status, content_source) "
             f"VALUES (%s, %s, 'pending', %s)",
             (sku, brand_name or "", source)
         )
         cnx.commit()
-        # Backfill brand_name if the row already existed
         cur.execute(
             f"UPDATE {EN_TABLE} SET brand_name = %s "
             f"WHERE sku = %s AND (brand_name IS NULL OR brand_name = '')",
@@ -394,7 +464,6 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
         )
         cnx.commit()
     else:
-        # Legacy table without brand_name
         cur.execute(
             f"INSERT IGNORE INTO {EN_TABLE} (sku, status, content_source) "
             f"VALUES (%s, 'pending', %s)",
@@ -467,7 +536,7 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[IMG] No local jpg found for url={url}")
                 continue
 
-            # >>> using pretty upload name for images (force .jpg)
+            # using pretty upload name for images (force .jpg)
             upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
 
             data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
@@ -506,7 +575,7 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[DOC] No local pdf found for url={url}")
                 continue
 
-            # >>> using pretty upload name for PDFs (force .pdf)
+            # using pretty upload name for PDFs (force .pdf)
             upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
 
             data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
@@ -564,7 +633,8 @@ def main():
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
 
-    folder = ensure_folder(client, "SEO Uploads")
+    # Use the correct folder for asset uploads
+    folder = ensure_folder(client, "Product Images")
     folder_id = folder["id"]
 
     limit = args.limit or BATCH_LIMIT or 0
