@@ -15,11 +15,13 @@ This version:
 
 Updates in this revision:
 - Use pretty sibling names for uploads (images + PDFs).
-- More robust asset lookup by URL:
+- Robust asset lookup by URL for PDFs:
   * exact URL
   * URL with query/hash stripped
-  * path-based LIKE fallback (for Widen/CDNs)
-  * alternate scheme fallback (https↔http)
+  * alternate scheme (https↔http)
+  * path-based LIKE (suffix)
+  * **asset_type widened to include '', NULL, 'pdf', 'application/pdf'**
+  * **filesystem fallback under ASSET_ROOT/doc for *__<basename> (then <basename>)**
 - Upload images to **Product Images**; PDFs to **Product Documents**.
 """
 #----nudge
@@ -246,7 +248,7 @@ def fetch_rows_for_exact_run(cnx, run_id: int, brand_filter: Optional[str], limi
     return rows
 
 
-# >>> URL helpers for asset lookups
+# ---------- URL helpers for asset lookups ----------
 def _strip_query_hash(u: str) -> str:
     try:
         from urllib.parse import urlparse, urlunparse
@@ -306,55 +308,47 @@ def pick_local_jpeg_for_url(cnx, url: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
-    cur = cnx.cursor()
-
-    # 1) exact match
+def _pdf_row_query(cur, where_url: str):
+    """
+    Helper to run the widened PDF query: tolerate blank/NULL/variant asset_type.
+    """
     cur.execute(
         """
         SELECT local_path, bytes
         FROM raw_assets
-        WHERE url = %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
+        WHERE url = %s
+          AND (asset_type = 'document'
+               OR asset_type = 'pdf'
+               OR asset_type = 'application/pdf'
+               OR asset_type = ''
+               OR asset_type IS NULL)
+          AND local_path IS NOT NULL AND local_path <> ''
         ORDER BY bytes DESC
         LIMIT 1
         """,
-        (url,)
+        (where_url,)
     )
-    row = cur.fetchone()
+    return cur.fetchone()
 
-    if not row:
-        # 2) fallback: stripped query/hash
-        url2 = _strip_query_hash(url)
-        cur.execute(
-            """
-            SELECT local_path, bytes
-            FROM raw_assets
-            WHERE url = %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
-            ORDER BY bytes DESC
-            LIMIT 1
-            """,
-            (url2,)
-        )
-        row = cur.fetchone()
 
-    if not row:
-        # 3) alternate scheme (http <-> https)
-        url3 = _alternate_scheme(url)
-        if url3 != url:
-            cur.execute(
-                """
-                SELECT local_path, bytes
-                FROM raw_assets
-                WHERE url = %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
-                ORDER BY bytes DESC
-                LIMIT 1
-                """,
-                (url3,)
-            )
-            row = cur.fetchone()
+def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
+    cur = cnx.cursor()
 
+    # 1) exact match
+    row = _pdf_row_query(cur, url)
+
+    # 2) stripped query/hash
     if not row:
-        # 4) last resort: path-based LIKE (helps with minor host/query variants, especially Widen)
+        row = _pdf_row_query(cur, _strip_query_hash(url))
+
+    # 3) alternate scheme (http <-> https)
+    if not row:
+        alt = _alternate_scheme(url)
+        if alt != url:
+            row = _pdf_row_query(cur, alt)
+
+    # 4) last resort: path-based LIKE (helps with minor host/query variants, especially Widen)
+    if not row:
         try:
             from urllib.parse import urlparse
             p = urlparse(url)
@@ -365,7 +359,13 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
                     """
                     SELECT local_path, bytes
                     FROM raw_assets
-                    WHERE url LIKE %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
+                    WHERE url LIKE %s
+                      AND (asset_type = 'document'
+                           OR asset_type = 'pdf'
+                           OR asset_type = 'application/pdf'
+                           OR asset_type = ''
+                           OR asset_type IS NULL)
+                      AND local_path IS NOT NULL AND local_path <> ''
                     ORDER BY bytes DESC
                     LIMIT 1
                     """,
@@ -376,6 +376,33 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
             pass
 
     cur.close()
+
+    # 5) filesystem fallback under ASSET_ROOT/doc
+    if not row:
+        try:
+            from urllib.parse import urlparse, unquote
+            basename = unquote((urlparse(url).path or "").split("/")[-1] or "").strip()
+            if basename:
+                doc_root = Path(ASSET_ROOT) / "doc"
+                # prefer pretty sibling pattern *__basename; then plain basename
+                candidates = list(doc_root.rglob(f"*__{basename}"))
+                if not candidates:
+                    candidates = list(doc_root.rglob(basename))
+                # choose the largest by size, which tends to be the full doc
+                best = None
+                best_sz = -1
+                for c in candidates:
+                    try:
+                        sz = c.stat().st_size
+                        if sz > best_sz:
+                            best, best_sz = c, sz
+                    except Exception:
+                        continue
+                if best and best.exists():
+                    return best
+        except Exception:
+            pass
+
     if not row:
         return None
     p = Path(row[0])
