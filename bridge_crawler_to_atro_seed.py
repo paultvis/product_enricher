@@ -19,7 +19,8 @@ Updates in this revision:
   * exact URL
   * URL with query/hash stripped
   * path-based LIKE fallback (for Widen/CDNs)
-- Upload assets to the **Product Images** folder (not “SEO Uploads”).
+  * alternate scheme fallback (https↔http)
+- Upload images to **Product Images**; PDFs to **Product Documents**.
 """
 #----nudge
 import os
@@ -245,13 +246,26 @@ def fetch_rows_for_exact_run(cnx, run_id: int, brand_filter: Optional[str], limi
     return rows
 
 
-# >>> NEW: small URL normaliser (strip query & hash) for asset lookups
+# >>> URL helpers for asset lookups
 def _strip_query_hash(u: str) -> str:
     try:
         from urllib.parse import urlparse, urlunparse
         p = urlparse(u)
         p2 = p._replace(query="", fragment="")
         return urlunparse(p2)
+    except Exception:
+        return u
+
+
+def _alternate_scheme(u: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(u)
+        if p.scheme == "https":
+            p = p._replace(scheme="http")
+        elif p.scheme == "http":
+            p = p._replace(scheme="https")
+        return urlunparse(p)
     except Exception:
         return u
 
@@ -324,11 +338,26 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
         row = cur.fetchone()
 
     if not row:
-        # 3) last resort: path-based LIKE (helps with minor host/query variants, especially Widen)
+        # 3) alternate scheme (http <-> https)
+        url3 = _alternate_scheme(url)
+        if url3 != url:
+            cur.execute(
+                """
+                SELECT local_path, bytes
+                FROM raw_assets
+                WHERE url = %s AND asset_type = 'document' AND local_path IS NOT NULL AND local_path <> ''
+                ORDER BY bytes DESC
+                LIMIT 1
+                """,
+                (url3,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        # 4) last resort: path-based LIKE (helps with minor host/query variants, especially Widen)
         try:
             from urllib.parse import urlparse
             p = urlparse(url)
-            # e.g. '/content/xyz/pdf/file.pdf' → look for '%/content/xyz/pdf/file.pdf'
             suffix = (p.path or "").strip()
             if suffix:
                 like = f"%{suffix}"
@@ -475,7 +504,7 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
 
 
 # ---------- Core processing ----------
-def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row: Dict[str, Any]):
+def process_one(client: AtroClient, crawler_cnx, enrich_cnx, images_folder_id: str, docs_folder_id: str, row: Dict[str, Any]):
     brand = (row.get("brand") or "").strip()
     mpn = (row.get("part_number") or "").strip()
     name = (row.get("title") or "").strip()
@@ -536,13 +565,12 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[IMG] No local jpg found for url={url}")
                 continue
 
-            # using pretty upload name for images (force .jpg)
             upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
 
             data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
             file_meta = client.upload_file(
                 name=upload_name,
-                folder_id=folder_id,
+                folder_id=images_folder_id,
                 data_url=data_url,
                 file_size=size,
                 mime_type=mime,
@@ -575,13 +603,12 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[DOC] No local pdf found for url={url}")
                 continue
 
-            # using pretty upload name for PDFs (force .pdf)
             upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
 
             data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
             file_meta = client.upload_file(
                 name=upload_name,
-                folder_id=folder_id,
+                folder_id=docs_folder_id,
                 data_url=data_url,
                 file_size=size,
                 mime_type=mime or "application/pdf",
@@ -633,9 +660,11 @@ def main():
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
 
-    # Use the correct folder for asset uploads
-    folder = ensure_folder(client, "Product Images")
-    folder_id = folder["id"]
+    # Use the correct folders for asset uploads
+    images_folder = ensure_folder(client, "Product Images")
+    docs_folder = ensure_folder(client, "Product Documents")
+    images_folder_id = images_folder["id"]
+    docs_folder_id = docs_folder["id"]
 
     limit = args.limit or BATCH_LIMIT or 0
 
@@ -662,7 +691,7 @@ def main():
 
     for row in rows:
         try:
-            process_one(client, cr_cnx, en_cnx, folder_id, row)
+            process_one(client, cr_cnx, en_cnx, images_folder_id, docs_folder_id, row)
             processed += 1
         except Exception as e:
             failed += 1
