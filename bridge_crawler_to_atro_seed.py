@@ -29,11 +29,19 @@ Multithreading update:
 - --upload-parallel (default 3) global semaphore to throttle concurrent file uploads
 - Per-thread AtroClient and DB connections (crawler + enrich)
 - One-time Atro specs cache shared across threads (read-only)
+
+Idempotency & hardening update:
+- bridge_progress table (in enrichment DB) stores per-SKU content hashes (brand/specs/images/docs)
+- Skip unchanged stages based on hashes (no Atro calls when not needed)
+- Name-based dedupe in Atro folder before uploading (images + docs)
+- Upload retries with exponential backoff
 """
 #----nudge
 import os
 import sys
 import json
+import time
+import hashlib
 import logging
 import argparse
 from pathlib import Path
@@ -104,6 +112,84 @@ def get_table_columns(cnx, table_schema: str, table_name: str) -> List[str]:
     cols = [r[0] for r in cur.fetchall()]
     cur.close()
     return cols
+
+
+# ---------- Idempotency helpers (hashes in enrichment DB) ----------
+def ensure_bridge_progress_table(cnx):
+    cur = cnx.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bridge_progress (
+            sku VARCHAR(32) NOT NULL,
+            brand VARCHAR(255) NULL,
+            mpn VARCHAR(255) NULL,
+            brand_html_hash CHAR(64) NULL,
+            specs_hash CHAR(64) NULL,
+            images_hash CHAR(64) NULL,
+            docs_hash CHAR(64) NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (sku)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    cnx.commit()
+    cur.close()
+
+
+def _stable_json_hash(value: Any) -> str:
+    try:
+        s = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        s = str(value)
+    return hashlib.sha256(s.encode("utf-8", "ignore")).hexdigest()
+
+
+def _urls_hash(items: List[Dict[str, Any]], key: str = "url") -> str:
+    urls = []
+    for it in (items or []):
+        u = (it.get(key) or "").strip()
+        if u:
+            urls.append(u)
+    urls = sorted(set(urls))
+    return _stable_json_hash(urls)
+
+
+def get_progress(cnx, sku: str) -> Dict[str, Optional[str]]:
+    cur = cnx.cursor(dictionary=True)
+    cur.execute("SELECT brand_html_hash, specs_hash, images_hash, docs_hash FROM bridge_progress WHERE sku = %s", (sku,))
+    row = cur.fetchone() or {}
+    cur.close()
+    return {
+        "brand_html_hash": row.get("brand_html_hash"),
+        "specs_hash": row.get("specs_hash"),
+        "images_hash": row.get("images_hash"),
+        "docs_hash": row.get("docs_hash"),
+    }
+
+
+def upsert_progress(cnx, sku: str, brand: str, mpn: str,
+                    brand_html_hash: Optional[str],
+                    specs_hash: Optional[str],
+                    images_hash: Optional[str],
+                    docs_hash: Optional[str]):
+    cur = cnx.cursor()
+    cur.execute(
+        """
+        INSERT INTO bridge_progress (sku, brand, mpn, brand_html_hash, specs_hash, images_hash, docs_hash)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          brand = VALUES(brand),
+          mpn = VALUES(mpn),
+          brand_html_hash = VALUES(brand_html_hash),
+          specs_hash = VALUES(specs_hash),
+          images_hash = VALUES(images_hash),
+          docs_hash = VALUES(docs_hash),
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (sku, brand, mpn, brand_html_hash, specs_hash, images_hash, docs_hash)
+    )
+    cnx.commit()
+    cur.close()
 
 
 # ---------- Atro helpers ----------
@@ -542,6 +628,49 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
     cur.close()
 
 
+# ---------- Atro file helpers (dedupe + retries) ----------
+def _find_file_in_folder_by_name(client: AtroClient, folder_id: str, name: str) -> Optional[Dict[str, Any]]:
+    """
+    Search Atro File by exact name within a folder. Returns the first match or None.
+    """
+    try:
+        from urllib.parse import urlencode
+        q = "?" + urlencode({
+            "maxSize": 50, "offset": 0,
+            "where[0][type]": "equals", "where[0][attribute]": "folderId", "where[0][value]": folder_id,
+            "where[1][type]": "equals", "where[1][attribute]": "name", "where[1][value]": name,
+        })
+        r = client._request("GET", f"/api/v1/File{q}")
+        data = r.json() or {}
+        lst = data.get("list") or []
+        return lst[0] if lst else None
+    except Exception:
+        return None
+
+
+def _upload_with_retries(client: AtroClient, *, name: str, folder_id: str,
+                         data_url: str, file_size: int, mime_type: str, extension: str,
+                         tags: str, max_retries: int = 3) -> Dict[str, Any]:
+    """
+    Upload file with simple exponential backoff retries.
+    """
+    attempt = 0
+    delay_seq = [2, 5, 10]
+    while True:
+        try:
+            return client.upload_file(
+                name=name, folder_id=folder_id, data_url=data_url, file_size=file_size,
+                mime_type=mime_type, extension=extension, hidden=False, tags=tags
+            )
+        except Exception as e:
+            if attempt >= max_retries - 1:
+                raise
+            sleep_for = delay_seq[min(attempt, len(delay_seq) - 1)]
+            LOG.warning(f"[ATRO] upload retry {attempt+1}/{max_retries} in {sleep_for}s :: name={name} err={e}")
+            time.sleep(sleep_for)
+            attempt += 1
+
+
 # ---------- Core processing ----------
 def process_one(
     client: AtroClient,
@@ -570,127 +699,158 @@ def process_one(
     # Ensure SEOProduct (seed with Product short/long on first create)
     seo, created = ensure_seo_for_product_seeded(client, product)
 
+    # ---------- Idempotency: compute current hashes ----------
+    current_brand_html = (row.get("description") or "").strip()
+    try:
+        current_specs = json.loads(row.get("specs_json") or "{}") or {}
+    except Exception:
+        current_specs = {}
+    try:
+        current_imgs = json.loads(row.get("images_json") or "[]") or []
+    except Exception:
+        current_imgs = []
+    try:
+        current_docs = json.loads(row.get("docs_json") or "[]") or []
+    except Exception:
+        current_docs = []
+
+    brand_html_hash = _stable_json_hash(current_brand_html) if current_brand_html else None
+    specs_hash = _stable_json_hash(current_specs) if current_specs else None
+    images_hash = _urls_hash(current_imgs) if current_imgs else None
+    docs_hash = _urls_hash(current_docs) if current_docs else None
+
+    prog = get_progress(enrich_cnx, sku_for_queue)
+    do_brand = (brand_html_hash is not None) and (brand_html_hash != prog.get("brand_html_hash"))
+    do_specs = (specs_hash is not None) and (specs_hash != prog.get("specs_hash"))
+    do_imgs  = (images_hash is not None) and (images_hash != prog.get("images_hash"))
+    do_docs  = (docs_hash is not None) and (docs_hash != prog.get("docs_hash"))
+
     # --- Patch brand content from crawler into SEOProduct.brandcontent ---
-    brand_html = (row.get("description") or "").strip()
-    if brand_html:
-        client.patch_seo(seo["id"], {"brandcontent": brand_html})
-        LOG.info(f"[ATRO] SEO patch brandcontent :: seo={seo['id']} bytes={len(brand_html)}")
+    if do_brand:
+        client.patch_seo(seo["id"], {"brandcontent": current_brand_html})
+        LOG.info(f"[ATRO] SEO patch brandcontent :: seo={seo['id']} bytes={len(current_brand_html)}")
+    else:
+        LOG.info(f"[SKIP] brandcontent unchanged :: sku={sku_for_queue}")
 
     # --- Sync specs ---
-    specs = {}
-    try:
-        specs = json.loads(row.get("specs_json") or "{}") or {}
-    except Exception:
-        specs = {}
-    if specs:
-        # use shared cached specs if available
+    if do_specs and current_specs:
         cached = cached_specs if cached_specs is not None else client.list_specs()
-        writer.upsert_specs_and_values(client, seo_id=seo["id"], specs_dict=specs, cached_specs=cached)
-        LOG.info(f"[ATRO] Specs upserted :: n={len(specs)}")
+        writer.upsert_specs_and_values(client, seo_id=seo["id"], specs_dict=current_specs, cached_specs=cached)
+        LOG.info(f"[ATRO] Specs upserted :: n={len(current_specs)}")
+    elif current_specs:
+        LOG.info(f"[SKIP] specs unchanged :: sku={sku_for_queue}")
 
     # --- Sync images (upload local jpgs, link, set main) ---
-    imgs = []
-    try:
-        imgs = json.loads(row.get("images_json") or "[]") or []
-    except Exception:
-        imgs = []
-
     uploaded_file_id_for_primary: Optional[str] = None
-    if imgs:
-        primary_url = None
-        for it in imgs:
-            if it and it.get("primary"):
-                primary_url = it.get("url")
-                break
-        if not primary_url and imgs:
-            primary_url = imgs[0].get("url")
+    if current_imgs:
+        if do_imgs:
+            primary_url = None
+            for it in current_imgs:
+                if it and it.get("primary"):
+                    primary_url = it.get("url")
+                    break
+            if not primary_url and current_imgs:
+                primary_url = current_imgs[0].get("url")
 
-        for it in imgs:
-            url = (it.get("url") or "").strip()
-            if not url:
-                continue
-            local_jpg = pick_local_jpeg_for_url(crawler_cnx, url)
-            if not local_jpg:
-                LOG.info(f"[IMG] No local jpg found for url={url}")
-                continue
+            for it in current_imgs:
+                url = (it.get("url") or "").strip()
+                if not url:
+                    continue
+                local_jpg = pick_local_jpeg_for_url(crawler_cnx, url)
+                if not local_jpg:
+                    LOG.info(f"[IMG] No local jpg found for url={url}")
+                    continue
 
-            upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
+                upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
+                # name-based dedupe in folder
+                existing = _find_file_in_folder_by_name(client, images_folder_id, upload_name)
+                if existing:
+                    file_meta = existing
+                else:
+                    data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
+                    if upload_sem:
+                        upload_sem.acquire()
+                    try:
+                        file_meta = _upload_with_retries(
+                            client,
+                            name=upload_name,
+                            folder_id=images_folder_id,
+                            data_url=data_url,
+                            file_size=size,
+                            mime_type=mime,
+                            extension="jpg",
+                            tags=f"bridge,crawler,{brand}",
+                        )
+                    finally:
+                        if upload_sem:
+                            upload_sem.release()
 
-            data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
+                client.link_file_to_seo(seo["id"], file_meta["id"])
+                if url == primary_url and not uploaded_file_id_for_primary:
+                    uploaded_file_id_for_primary = file_meta["id"]
 
-            # throttle concurrent uploads if a semaphore is provided
-            if upload_sem:
-                upload_sem.acquire()
-            try:
-                file_meta = client.upload_file(
-                    name=upload_name,
-                    folder_id=images_folder_id,
-                    data_url=data_url,
-                    file_size=size,
-                    mime_type=mime,
-                    extension="jpg",
-                    hidden=False,
-                    tags=f"bridge,crawler,{brand}"
-                )
-            finally:
-                if upload_sem:
-                    upload_sem.release()
-
-            client.link_file_to_seo(seo["id"], file_meta["id"])
-            if url == primary_url and not uploaded_file_id_for_primary:
-                uploaded_file_id_for_primary = file_meta["id"]
-
-        if uploaded_file_id_for_primary:
-            client.set_seo_main_image(seo["id"], uploaded_file_id_for_primary)
-            LOG.info(f"[ATRO] main image set :: seo={seo['id']} file={uploaded_file_id_for_primary}")
+            if uploaded_file_id_for_primary:
+                client.set_seo_main_image(seo["id"], uploaded_file_id_for_primary)
+                LOG.info(f"[ATRO] main image set :: seo={seo['id']} file={uploaded_file_id_for_primary}")
+        else:
+            LOG.info(f"[SKIP] images unchanged :: sku={sku_for_queue}")
 
     # --- Sync documents (upload local pdfs, link) ---
-    docs = []
-    try:
-        docs = json.loads(row.get("docs_json") or "[]") or []
-    except Exception:
-        docs = []
-    if docs:
-        linked_docs = 0
-        for it in docs:
-            url = (it.get("url") or "").strip()
-            if not url:
-                continue
-            local_pdf = pick_local_pdf_for_url(crawler_cnx, url)
-            if not local_pdf:
-                LOG.info(f"[DOC] No local pdf found for url={url}")
-                continue
+    if current_docs:
+        if do_docs:
+            linked_docs = 0
+            for it in current_docs:
+                url = (it.get("url") or "").strip()
+                if not url:
+                    continue
+                local_pdf = pick_local_pdf_for_url(crawler_cnx, url)
+                if not local_pdf:
+                    LOG.info(f"[DOC] No local pdf found for url={url}")
+                    continue
 
-            upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
+                upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
+                # name-based dedupe
+                existing = _find_file_in_folder_by_name(client, docs_folder_id, upload_name)
+                if existing:
+                    file_meta = existing
+                else:
+                    data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
+                    if upload_sem:
+                        upload_sem.acquire()
+                    try:
+                        file_meta = _upload_with_retries(
+                            client,
+                            name=upload_name,
+                            folder_id=docs_folder_id,
+                            data_url=data_url,
+                            file_size=size,
+                            mime_type=mime or "application/pdf",
+                            extension=ext or "pdf",
+                            tags=f"bridge,crawler,{brand}",
+                        )
+                    finally:
+                        if upload_sem:
+                            upload_sem.release()
 
-            data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
+                client.link_file_to_seo(seo["id"], file_meta["id"])
+                linked_docs += 1
 
-            # throttle concurrent uploads if a semaphore is provided
-            if upload_sem:
-                upload_sem.acquire()
-            try:
-                file_meta = client.upload_file(
-                    name=upload_name,
-                    folder_id=docs_folder_id,
-                    data_url=data_url,
-                    file_size=size,
-                    mime_type=mime or "application/pdf",
-                    extension=ext or "pdf",
-                    hidden=False,
-                    tags=f"bridge,crawler,{brand}"
-                )
-            finally:
-                if upload_sem:
-                    upload_sem.release()
-
-            client.link_file_to_seo(seo["id"], file_meta["id"])
-            linked_docs += 1
-
-        LOG.info(f"[ATRO] documents linked :: seo={seo['id']} n={linked_docs}")
+            LOG.info(f"[ATRO] documents linked :: seo={seo['id']} n={linked_docs}")
+        else:
+            LOG.info(f"[SKIP] documents unchanged :: sku={sku_for_queue}")
 
     # --- Enqueue SKU for the enricher (now includes brand_name when available) ---
     enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
     LOG.info(f"[QUEUE] seeded :: sku={sku_for_queue} brand={brand} source=crawler")
+
+    # --- Persist progress hashes ---
+    upsert_progress(
+        enrich_cnx, sku_for_queue, brand, mpn,
+        brand_html_hash=brand_html_hash,
+        specs_hash=specs_hash,
+        images_hash=images_hash,
+        docs_hash=docs_hash
+    )
 
 
 def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
@@ -715,6 +875,8 @@ def _thread_worker(row: Dict[str, Any], images_folder_id: str, docs_folder_id: s
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
     try:
+        # ensure progress table exists (once per-thread is safe & cheap)
+        ensure_bridge_progress_table(en_cnx)
         process_one(client, cr_cnx, en_cnx, images_folder_id, docs_folder_id, row, upload_sem, cached_specs)
         return True
     finally:
@@ -753,6 +915,10 @@ def main():
     main_client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
 
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
+    en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
+
+    # Ensure progress table once in main thread
+    ensure_bridge_progress_table(en_cnx)
 
     # Use the correct folders for asset uploads
     images_folder = ensure_folder(main_client, "Product Images")
@@ -767,6 +933,7 @@ def main():
         if rid is None:
             LOG.info("No runs found to process.")
             cr_cnx.close()
+            en_cnx.close()
             return 0
         LOG.info(f"Selected latest run_id={rid} (brand={args.brand or 'ALL'})")
         rows = fetch_rows_for_exact_run(cr_cnx, rid, brand_filter=args.brand, limit=limit)
@@ -809,9 +976,13 @@ def main():
 
     LOG.info(f"Done. processed={processed} failed={failed}")
 
-    # close main-thread connection
+    # close main-thread connections
     try:
         cr_cnx.close()
+    except Exception:
+        pass
+    try:
+        en_cnx.close()
     except Exception:
         pass
 
