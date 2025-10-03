@@ -20,9 +20,15 @@ Updates in this revision:
   * URL with query/hash stripped
   * alternate scheme (https↔http)
   * path-based LIKE (suffix)
-  * **asset_type widened to include '', NULL, 'pdf', 'application/pdf'**
-  * **filesystem fallback under ASSET_ROOT/doc for *__<basename> (then <basename>)**
+  * asset_type widened to include '', NULL, 'pdf', 'application/pdf'
+  * filesystem fallback under ASSET_ROOT/doc for *__<basename> (then <basename>)
 - Upload images to **Product Images**; PDFs to **Product Documents**.
+
+Multithreading update:
+- --workers (default 4) to process products in parallel via ThreadPoolExecutor
+- --upload-parallel (default 3) global semaphore to throttle concurrent file uploads
+- Per-thread AtroClient and DB connections (crawler + enrich)
+- One-time Atro specs cache shared across threads (read-only)
 """
 #----nudge
 import os
@@ -32,6 +38,8 @@ import logging
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import mysql.connector
 
@@ -62,6 +70,10 @@ EN_TABLE = os.getenv("ENRICH_DB_TABLE", "enrichment_queue")
 
 ASSET_ROOT = os.getenv("ASSET_ROOT", "/opt/brand_crawler/data/assets")
 BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "0"))  # 0 = unlimited
+
+# Global throttles / caches
+_UPLOAD_SEM: Optional[threading.Semaphore] = None
+_SPECS_CACHE: Optional[Dict[str, Any]] = None  # read-only map from Atro (list_specs())
 
 
 # --- Product → SEOProduct base field mapping (seed on SEO creation only) ---
@@ -531,7 +543,16 @@ def enqueue_sku(cnx, sku: str, brand_name: Optional[str], source: str = "crawler
 
 
 # ---------- Core processing ----------
-def process_one(client: AtroClient, crawler_cnx, enrich_cnx, images_folder_id: str, docs_folder_id: str, row: Dict[str, Any]):
+def process_one(
+    client: AtroClient,
+    crawler_cnx,
+    enrich_cnx,
+    images_folder_id: str,
+    docs_folder_id: str,
+    row: Dict[str, Any],
+    upload_sem: Optional[threading.Semaphore],
+    cached_specs: Optional[Dict[str, Any]],
+):
     brand = (row.get("brand") or "").strip()
     mpn = (row.get("part_number") or "").strip()
     name = (row.get("title") or "").strip()
@@ -562,8 +583,9 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, images_folder_id: s
     except Exception:
         specs = {}
     if specs:
-        cached_specs = client.list_specs()
-        writer.upsert_specs_and_values(client, seo_id=seo["id"], specs_dict=specs, cached_specs=cached_specs)
+        # use shared cached specs if available
+        cached = cached_specs if cached_specs is not None else client.list_specs()
+        writer.upsert_specs_and_values(client, seo_id=seo["id"], specs_dict=specs, cached_specs=cached)
         LOG.info(f"[ATRO] Specs upserted :: n={len(specs)}")
 
     # --- Sync images (upload local jpgs, link, set main) ---
@@ -595,16 +617,25 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, images_folder_id: s
             upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
 
             data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
-            file_meta = client.upload_file(
-                name=upload_name,
-                folder_id=images_folder_id,
-                data_url=data_url,
-                file_size=size,
-                mime_type=mime,
-                extension="jpg",
-                hidden=False,
-                tags=f"bridge,crawler,{brand}"
-            )
+
+            # throttle concurrent uploads if a semaphore is provided
+            if upload_sem:
+                upload_sem.acquire()
+            try:
+                file_meta = client.upload_file(
+                    name=upload_name,
+                    folder_id=images_folder_id,
+                    data_url=data_url,
+                    file_size=size,
+                    mime_type=mime,
+                    extension="jpg",
+                    hidden=False,
+                    tags=f"bridge,crawler,{brand}"
+                )
+            finally:
+                if upload_sem:
+                    upload_sem.release()
+
             client.link_file_to_seo(seo["id"], file_meta["id"])
             if url == primary_url and not uploaded_file_id_for_primary:
                 uploaded_file_id_for_primary = file_meta["id"]
@@ -633,16 +664,25 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, images_folder_id: s
             upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
 
             data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
-            file_meta = client.upload_file(
-                name=upload_name,
-                folder_id=docs_folder_id,
-                data_url=data_url,
-                file_size=size,
-                mime_type=mime or "application/pdf",
-                extension=ext or "pdf",
-                hidden=False,
-                tags=f"bridge,crawler,{brand}"
-            )
+
+            # throttle concurrent uploads if a semaphore is provided
+            if upload_sem:
+                upload_sem.acquire()
+            try:
+                file_meta = client.upload_file(
+                    name=upload_name,
+                    folder_id=docs_folder_id,
+                    data_url=data_url,
+                    file_size=size,
+                    mime_type=mime or "application/pdf",
+                    extension=ext or "pdf",
+                    hidden=False,
+                    tags=f"bridge,crawler,{brand}"
+                )
+            finally:
+                if upload_sem:
+                    upload_sem.release()
+
             client.link_file_to_seo(seo["id"], file_meta["id"])
             linked_docs += 1
 
@@ -664,6 +704,30 @@ def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
     return int(row[0]) if row and row[0] is not None else None
 
 
+def _thread_worker(row: Dict[str, Any], images_folder_id: str, docs_folder_id: str, upload_sem: Optional[threading.Semaphore], cached_specs: Optional[Dict[str, Any]]):
+    """
+    Per-thread worker:
+    - creates its own AtroClient
+    - creates its own DB connections
+    - processes a single row
+    """
+    client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
+    cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
+    en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
+    try:
+        process_one(client, cr_cnx, en_cnx, images_folder_id, docs_folder_id, row, upload_sem, cached_specs)
+        return True
+    finally:
+        try:
+            cr_cnx.close()
+        except Exception:
+            pass
+        try:
+            en_cnx.close()
+        except Exception:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-run-id", type=int, default=None, help="Process rows with run_id >= this value")
@@ -671,6 +735,9 @@ def main():
     ap.add_argument("--latest-run", action="store_true", help="Process only rows from the most recent run_id (optionally per --brand)")
     ap.add_argument("--brand", type=str, default=None, help="Restrict to brand name")
     ap.add_argument("--limit", type=int, default=0, help="Max rows to process (0 = no limit)")
+    # Multithreading knobs
+    ap.add_argument("--workers", type=int, default=4, help="Number of worker threads to process products")
+    ap.add_argument("--upload-parallel", type=int, default=3, help="Max concurrent file uploads across all threads")
     args = ap.parse_args()
 
     # Default to --latest-run if no mode is set
@@ -682,14 +749,14 @@ def main():
         LOG.error("ATRO_BASE_URL / ATRO_USER / ATRO_PASS must be set in env.")
         return 2
 
-    client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
+    # Main-thread client to prepare shared resources (folders + specs cache)
+    main_client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
 
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
-    en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
 
     # Use the correct folders for asset uploads
-    images_folder = ensure_folder(client, "Product Images")
-    docs_folder = ensure_folder(client, "Product Documents")
+    images_folder = ensure_folder(main_client, "Product Images")
+    docs_folder = ensure_folder(main_client, "Product Documents")
     images_folder_id = images_folder["id"]
     docs_folder_id = docs_folder["id"]
 
@@ -700,7 +767,6 @@ def main():
         if rid is None:
             LOG.info("No runs found to process.")
             cr_cnx.close()
-            en_cnx.close()
             return 0
         LOG.info(f"Selected latest run_id={rid} (brand={args.brand or 'ALL'})")
         rows = fetch_rows_for_exact_run(cr_cnx, rid, brand_filter=args.brand, limit=limit)
@@ -713,20 +779,42 @@ def main():
 
     LOG.info(f"Selected {len(rows)} (brand,mpn) rows from crawler for bridging")
 
+    # Build shared read-only specs cache once (optional optimization)
+    global _SPECS_CACHE
+    try:
+        _SPECS_CACHE = main_client.list_specs()
+    except Exception:
+        _SPECS_CACHE = None
+
+    # Global upload semaphore
+    global _UPLOAD_SEM
+    _UPLOAD_SEM = threading.Semaphore(max(1, int(args.upload_parallel)))
+
     processed = 0
     failed = 0
 
-    for row in rows:
-        try:
-            process_one(client, cr_cnx, en_cnx, images_folder_id, docs_folder_id, row)
-            processed += 1
-        except Exception as e:
-            failed += 1
-            LOG.exception(f"[ERROR] row id={row.get('id')} brand={row.get('brand')} mpn={row.get('part_number')}: {e}")
+    # Thread pool over rows
+    with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as ex:
+        futures = [ex.submit(_thread_worker, row, images_folder_id, docs_folder_id, _UPLOAD_SEM, _SPECS_CACHE) for row in rows]
+        for fut in as_completed(futures):
+            try:
+                ok = fut.result()
+                if ok:
+                    processed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                LOG.exception(f"[ERROR] worker failed: {e}")
 
     LOG.info(f"Done. processed={processed} failed={failed}")
-    cr_cnx.close()
-    en_cnx.close()
+
+    # close main-thread connection
+    try:
+        cr_cnx.close()
+    except Exception:
+        pass
+
     return 1 if failed else 0
 
 
