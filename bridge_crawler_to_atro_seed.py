@@ -277,6 +277,58 @@ def pick_local_pdf_for_url(cnx, url: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+# ---------- Pretty upload name helpers (NEW) ----------
+# >>> NEW helper: derive a human-friendly upload name using the pretty sibling (<sha>__original.ext)
+def _safe_base_name_from_url(u: Optional[str], fallback: str = "file") -> str:
+    try:
+        if not u:
+            return fallback
+        from urllib.parse import urlparse, unquote
+        p = urlparse(u)
+        stem = unquote((p.path or "").split("/")[-1] or "") or fallback
+        # keep alnum, dot, underscore, dash; collapse other chars to '-'
+        stem = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in stem)
+        while "--" in stem:
+            stem = stem.replace("--", "-")
+        stem = stem.strip("-.")
+        return stem or fallback
+    except Exception:
+        return fallback
+
+
+def _force_ext(name: str, forced_ext: Optional[str]) -> str:
+    if not forced_ext:
+        return name
+    # strip existing trailing image/doc chain like ".webp.jpg" → keep stem
+    import re as _re
+    stem = _re.sub(r"\.(webp|avif|jpe?g|png|gif|bmp|tiff|pdf)+$", "", name, flags=_re.I)
+    return f"{stem}.{forced_ext.lower()}"
+
+
+def _compute_upload_name(local_path: Path, forced_ext: Optional[str], original_url: Optional[str]) -> str:
+    """
+    Prefer the 'pretty' sibling created by the crawler: <sha>__original-name.ext
+    If missing, derive from the original URL; finally fall back to the local basename.
+    Always enforce forced_ext if provided (e.g., 'jpg' or 'pdf').
+    """
+    try:
+        sha = local_path.name  # hashed filename used by crawler storage
+        # look for a sibling "<sha>__*"
+        parent = local_path.parent
+        # only scan limited entries for speed; directory contains few files
+        for entry in parent.iterdir():
+            n = entry.name
+            if n.startswith(f"{sha}__"):
+                pretty = n.split("__", 1)[1] or n
+                return _force_ext(pretty, forced_ext)
+    except Exception:
+        pass
+
+    # fallback from URL
+    derived = _safe_base_name_from_url(original_url, fallback=local_path.name)
+    return _force_ext(derived, forced_ext)
+
+
 # ---------- Enrichment DB helpers ----------
 def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
     cur = cnx.cursor()
@@ -415,9 +467,12 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[IMG] No local jpg found for url={url}")
                 continue
 
+            # >>> using pretty upload name for images (force .jpg)
+            upload_name = _compute_upload_name(local_jpg, forced_ext="jpg", original_url=url)
+
             data_url, size, mime, _ext = writer._to_data_url(local_jpg, force_ext="jpg")
             file_meta = client.upload_file(
-                name=local_jpg.name,
+                name=upload_name,
                 folder_id=folder_id,
                 data_url=data_url,
                 file_size=size,
@@ -451,9 +506,12 @@ def process_one(client: AtroClient, crawler_cnx, enrich_cnx, folder_id: str, row
                 LOG.info(f"[DOC] No local pdf found for url={url}")
                 continue
 
+            # >>> using pretty upload name for PDFs (force .pdf)
+            upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
+
             data_url, size, mime, ext = writer._to_data_url(local_pdf, force_ext=None)
             file_meta = client.upload_file(
-                name=local_pdf.name,
+                name=upload_name,
                 folder_id=folder_id,
                 data_url=data_url,
                 file_size=size,
