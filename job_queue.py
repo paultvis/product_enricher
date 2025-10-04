@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 # Module-level DB config; can be overridden via configure_db()
 DB_CONFIG = {
     'host': os.getenv('ENRICH_DB_HOST', '192.168.0.28'),
-    'user': os.getenv('ENRICH_DB_USER') or '',
-    'password': os.getenv('ENRICH_DB_PASS') or '',
+    'user': os.getenv('ENRICH_DB_USER') or 'root',
+    'password': os.getenv('ENRICH_DB_PASS') or 'Albatr0ss22!',
     'database': os.getenv('ENRICH_DB_NAME', 'vwr'),
     'use_pure': True,
     'connection_timeout': 10
