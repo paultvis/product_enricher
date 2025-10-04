@@ -248,7 +248,7 @@ def _build_messages(product: Dict[str, Any]):
         "quality": "string — 'rich' or 'sparse'."
     }
 
-     common_system = (
+    common_system = (
         "Goal: Rewrite the provided manufacturer, Vision Marine, and supplier text into a high-converting, emotionally engaging "
         "product description for boaters. Keep every factual detail intact (power ratings, weights, dimensions, screen types, "
         "materials, etc.), but transform dry feature lists into compelling copy that helps customers imagine how the product improves "
