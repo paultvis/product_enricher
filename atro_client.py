@@ -1,15 +1,18 @@
 import base64
 import requests
 import threading
+import time
 from urllib.parse import urlencode
 
 #---- nudge
 class AtroClient:
-    def __init__(self, base_url: str, user: str, password: str, timeout: int = 15):
+    def __init__(self, base_url: str, user: str, password: str, timeout: int = 15, upload_timeout: int | None = None, max_retries: int = 2):
         self.base_url = base_url.rstrip("/")
         self.user = user
         self.password = password
         self.timeout = timeout
+        self.upload_timeout = upload_timeout or timeout
+        self.max_retries = max(0, int(max_retries))
         self._token = None
         self._lock = threading.Lock()
 
@@ -34,14 +37,31 @@ class AtroClient:
         return {"Accept": "application/json", "Authorization": f"Bearer {self._token}"}
 
     def _request(self, method, path, **kwargs):
+        """Resilient request with re-auth + limited retries for transient errors/timeouts."""
         url = f"{self.base_url}{path}"
-        r = requests.request(method, url, headers=self._headers(), timeout=self.timeout, **kwargs)
-        if r.status_code == 401:
-            with self._lock:
-                self._auth()
-            r = requests.request(method, url, headers=self._headers(), timeout=self.timeout, **kwargs)
-        r.raise_for_status()
-        return r
+        timeout = kwargs.pop("timeout", self.timeout)
+        attempt = 0
+        while True:
+            try:
+                r = requests.request(method, url, headers=self._headers(), timeout=timeout, **kwargs)
+                if r.status_code == 401:
+                    # refresh token once
+                    with self._lock:
+                        self._auth()
+                    r = requests.request(method, url, headers=self._headers(), timeout=timeout, **kwargs)
+                # retry on gateway/server hiccups
+                if r.status_code in (502, 503, 504) and attempt < self.max_retries:
+                    time.sleep(2 * (attempt + 1))
+                    attempt += 1
+                    continue
+                r.raise_for_status()
+                return r
+            except requests.exceptions.RequestException:
+                if attempt < self.max_retries:
+                    time.sleep(2 * (attempt + 1))
+                    attempt += 1
+                    continue
+                raise
 
     @staticmethod
     def _json_or_empty(r: requests.Response):
@@ -203,7 +223,7 @@ class AtroClient:
         if tags: payload["tags"] = tags
 
         # Atro supports ?silent=true on create as you shared
-        r = self._request("POST", "/api/v1/File?silent=true", json=payload)
+        r = self._request("POST", "/api/v1/File?silent=true", json=payload, timeout=self.upload_timeout)
         return r.json()
 
     # ---- Link File → SEOProduct

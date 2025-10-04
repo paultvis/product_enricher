@@ -1,0 +1,14 @@
+# Core database connector
+mysql-connector-python>=8.3.0
+
+# For structured logging
+loguru>=0.7.2
+
+# For environment variable management
+python-dotenv>=1.0.1
+
+# For scheduling / async jobs if needed
+schedule>=1.2.1
+
+# For HTTP calls to Node runner, if we add API hooks
+requests>=2.32.3
