@@ -219,7 +219,10 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
             upsert_specs_and_values(client, seo["id"], ai.get("specs") or {}, cached_specs)
 
             # Determine quality/refresh + brand backlog signals
-            quality = ai.get("quality", "unknown")
+            allowed_qualities = {"unknown", "rich", "sparse"}
+            quality = str(ai.get("quality", "unknown")).strip().lower()
+            if quality not in allowed_qualities:
+                quality = "unknown"
             needs_refresh = 1 if quality == "sparse" else 0
 
             # updated_via for now mirrors detected content_source (until brand corpus stage)
