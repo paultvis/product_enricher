@@ -45,6 +45,10 @@ Additional polish in this update:
 - Best-effort queue seeding even when a worker errors
 - Periodic throughput: rows/min and uploads/min
 - Startup capability line: queue brand_name column present?, progress table ensured, parallelism
+
+Repair mode:
+- --repair-missed (DB-only) ensures queue + progress rows even when a prior worker failed mid-run
+- --requeue-failed can flip failed → pending so the enricher will process them
 """
 #----nudge
 import os
@@ -256,7 +260,7 @@ def ensure_product_by_mpn(
             "brandId": brand["id"],
         }
         LOG.info(f"[ATRO] Create Product (minimal) :: mpn={mpn} sku={payload['sku']} brand={brand.get('name')}")
-        r = client._request("POST", "/api/v1/Product", json=payload)
+        r = client._request("PATCH" if False else "POST", "/api/v1/Product", json=payload)
         prod = r.json()
     else:
         desired_sku = (sku_preferred or prod.get("sku") or "").strip()
@@ -291,6 +295,16 @@ def ensure_folder(client: AtroClient, name: str = "Product Images") -> Dict[str,
         return f
     r = client._request("POST", "/api/v1/Folder", json={"name": name})
     return r.json()
+
+# --- small helper to inspect current SEO.brandcontent when needed ---
+def _get_seo_brandcontent(client: AtroClient, seo_id: str) -> Optional[str]:
+    try:
+        r = client._request("GET", f"/api/v1/SEOProduct/{seo_id}?select=brandcontent")
+        data = r.json() or {}
+        bc = data.get("brandcontent")
+        return bc if isinstance(bc, str) else None
+    except Exception:
+        return None
 
 # ---------- Crawler DB access ----------
 def fetch_latest_crawler_rows(cnx, brand_filter: Optional[str], since_run_id: Optional[int], limit: int) -> List[Dict[str, Any]]:
@@ -723,7 +737,6 @@ def _get_linked_file_ids_for_seo(client: AtroClient, seo_id: str) -> Set[str]:
         lst = data.get("list") or []
         result = set()
         for it in lst:
-            # records usually contain fileId
             fid = it.get("fileId")
             if fid:
                 result.add(fid)
@@ -734,9 +747,6 @@ def _get_linked_file_ids_for_seo(client: AtroClient, seo_id: str) -> Set[str]:
 def _upload_with_retries(client: AtroClient, *, name: str, folder_id: str,
                          data_url: str, file_size: int, mime_type: str, extension: str,
                          tags: str, max_retries: int = 3) -> Dict[str, Any]:
-    """
-    Upload file with simple exponential backoff retries.
-    """
     attempt = 0
     delay_seq = [2, 5, 10]
     while True:
@@ -756,17 +766,12 @@ def _upload_with_retries(client: AtroClient, *, name: str, folder_id: str,
             attempt += 1
 
 def _safe_link_file_to_seo(client: AtroClient, seo_id: str, file_id: str, already_linked: Set[str]):
-    """
-    Link file to SEO unless already linked.
-    Treat HTTP 400 as 'already linked' and continue.
-    """
     if file_id in already_linked:
         return
     try:
         client.link_file_to_seo(seo_id, file_id)
         already_linked.add(file_id)
     except requests.HTTPError as e:
-        # If server says bad request, assume duplicate relation and continue
         if e.response is not None and e.response.status_code == 400:
             LOG.info(f"[ATRO] link already exists (400), skipping :: seo={seo_id} file={file_id}")
             already_linked.add(file_id)
@@ -822,17 +827,27 @@ def process_one(
     docs_hash = _urls_hash(current_docs) if current_docs else None
 
     prog = get_progress(enrich_cnx, sku_for_queue)
+
+    # default gating by hash
     do_brand = (brand_html_hash is not None) and (brand_html_hash != prog.get("brand_html_hash"))
     do_specs = (specs_hash is not None) and (specs_hash != prog.get("specs_hash"))
     do_imgs  = (images_hash is not None) and (images_hash != prog.get("images_hash"))
     do_docs  = (docs_hash is not None) and (docs_hash != prog.get("docs_hash"))
 
-    # ---------- Early exit: if all parts unchanged, skip all Atro work ----------
-    if not (do_brand or do_specs or do_imgs or do_docs):
+    # --- NEW: force brand patch when SEO is just created OR when existing SEO has empty brandcontent
+    force_brand = False
+    if current_brand_html:
+        if created:
+            force_brand = True
+        elif not do_brand:
+            bc = _get_seo_brandcontent(client, seo["id"])  # one cheap GET only when needed
+            if not (bc and bc.strip()):
+                force_brand = True
+
+    # ---------- Early exit: if nothing to do (but allow forced brand patch) ----------
+    if not (do_brand or do_specs or do_imgs or do_docs or force_brand):
         LOG.info(f"[SKIP] all unchanged :: sku={sku_for_queue}")
-        # still ensure the queue row exists
         enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
-        # refresh progress row (keeps timestamps moving forward if desired)
         upsert_progress(
             enrich_cnx, sku_for_queue, brand, mpn,
             brand_html_hash=brand_html_hash,
@@ -843,9 +858,10 @@ def process_one(
         return
 
     # --- Patch brand content ---
-    if do_brand:
+    if do_brand or force_brand:
         client.patch_seo(seo["id"], {"brandcontent": current_brand_html})
-        LOG.info(f"[ATRO] brandcontent patched :: seo={seo['id']} bytes={len(current_brand_html)}")
+        reason = "hash-change" if do_brand else "forced-empty-or-created"
+        LOG.info(f"[ATRO] brandcontent patched :: seo={seo['id']} bytes={len(current_brand_html)} reason={reason}")
     else:
         LOG.info(f"[SKIP] brandcontent unchanged :: sku={sku_for_queue}")
 
@@ -856,11 +872,10 @@ def process_one(
             LOG.info(f"[ATRO] specs upserted :: seo={seo['id']} n={len(current_specs)}")
         except Exception as e:
             LOG.exception(f"[ERROR] specs upsert failed :: sku={sku_for_queue} err={e}")
-            # carry on; images/docs may still succeed
     else:
         LOG.info(f"[SKIP] specs unchanged/empty :: sku={sku_for_queue}")
 
-    # --- Upload/link images (name-dedupe + link-dedupe) ---
+    # --- Upload/link images ---
     if do_imgs and current_imgs:
         linked = 0
         linked_ids = _get_linked_file_ids_for_seo(client, seo["id"])
@@ -894,11 +909,9 @@ def process_one(
                     if upload_sem:
                         upload_sem.release()
 
-            # link file if not already linked
             _safe_link_file_to_seo(client, seo["id"], file_meta["id"], linked_ids)
             linked += 1
 
-        # set primary image to the largest area image already chosen by crawler (first element)
         if linked and not seo.get("mainImageId"):
             try:
                 first = current_imgs[0]
@@ -952,7 +965,6 @@ def process_one(
                     if upload_sem:
                         upload_sem.release()
 
-            # link file if not already linked
             _safe_link_file_to_seo(client, seo["id"], file_meta["id"], linked_ids)
             linked_docs += 1
 
@@ -960,7 +972,7 @@ def process_one(
     else:
         LOG.info(f"[SKIP] documents unchanged :: sku={sku_for_queue}")
 
-    # --- Enqueue SKU for the enricher (now includes brand_name when available) ---
+    # --- Enqueue SKU for the enricher ---
     enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
     LOG.info(f"[QUEUE] seeded :: sku={sku_for_queue} brand={brand} source=crawler")
 
@@ -972,7 +984,7 @@ def process_one(
         images_hash=images_hash,
         docs_hash=docs_hash
     )
-    LOG.info(f"[PROGRESS] upserted :: sku={sku_for_queue} brand={brand} changed={{'brand': %s, 'specs': %s, 'images': %s, 'docs': %s}}" % (do_brand, do_specs, do_imgs, do_docs))
+    LOG.info(f"[PROGRESS] upserted :: sku={sku_for_queue} brand={brand} changed={{'brand': %s, 'specs': %s, 'images': %s, 'docs': %s}}" % (do_brand or force_brand, do_specs, do_imgs, do_docs))
 
 def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
     cur = cnx.cursor()
@@ -985,29 +997,18 @@ def _latest_run_id(cnx, brand_filter: Optional[str]) -> Optional[int]:
     return int(row[0]) if row and row[0] is not None else None
 
 def _thread_worker(row: Dict[str, Any], images_folder_id: str, docs_folder_id: str, upload_sem: Optional[threading.Semaphore], cached_specs: Optional[Dict[str, Any]]):
-    """
-    Per-thread worker:
-    - creates its own AtroClient
-    - creates its own DB connections
-    - processes a single row
-    """
     client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
     try:
-        # ensure progress table exists (once per-thread is safe & cheap)
         ensure_bridge_progress_table(en_cnx)
         process_one(client, cr_cnx, en_cnx, images_folder_id, docs_folder_id, row, upload_sem, cached_specs)
         return True
     finally:
-        try:
-            cr_cnx.close()
-        except Exception:
-            pass
-        try:
-            en_cnx.close()
-        except Exception:
-            pass
+        try: cr_cnx.close()
+        except Exception: pass
+        try: en_cnx.close()
+        except Exception: pass
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1016,7 +1017,6 @@ def main():
     ap.add_argument("--latest-run", action="store_true", help="Process only rows from the most recent run_id (optionally per --brand)")
     ap.add_argument("--brand", type=str, default=None, help="Restrict to brand name")
     ap.add_argument("--limit", type=int, default=0, help="Max rows to process (0 = no limit)")
-    # Multithreading knobs
     ap.add_argument("--workers", type=int, default=4, help="Number of worker threads to process products")
     ap.add_argument("--upload-parallel", type=int, default=3, help="Max concurrent file uploads across all threads")
     ap.add_argument("--repair-missed", action="store_true",
@@ -1025,7 +1025,6 @@ def main():
                     help="With --repair-missed: reset status='failed' rows back to 'pending'")
     args = ap.parse_args()
 
-    # Default to --latest-run if no mode is set
     if args.since_run_id is None and not args.all and not args.latest_run:
         args.latest_run = True
         LOG.info("No mode flag provided; defaulting to --latest-run")
@@ -1034,13 +1033,11 @@ def main():
         LOG.error("ATRO_BASE_URL / ATRO_USER / ATRO_PASS must be set in env.")
         return 2
 
-    # Main-thread client to prepare shared resources (folders + specs cache)
     main_client = AtroClient(ATRO_BASE_URL, ATRO_USER, ATRO_PASS)
 
     cr_cnx = _mysql_connect(CR_HOST, CR_USER, CR_PASS, CR_NAME)
     en_cnx = _mysql_connect(EN_HOST, EN_USER, EN_PASS, EN_NAME)
 
-    # Ensure progress table once in main thread
     ensure_bridge_progress_table(en_cnx)
     try:
         cols = set(get_table_columns(en_cnx, EN_NAME, EN_TABLE))
@@ -1048,7 +1045,6 @@ def main():
         cols = set()
     LOG.info(f"[CAPABILITY] queue_table={EN_TABLE} brand_name_col={'yes' if 'brand_name' in cols else 'no'} progress_table=bridge_progress workers={args.workers} upload_parallel={args.upload_parallel}")
 
-    # Use the correct folders for asset uploads
     images_folder = ensure_folder(main_client, "Product Images")
     docs_folder = ensure_folder(main_client, "Product Documents")
     images_folder_id = images_folder["id"]
@@ -1060,8 +1056,7 @@ def main():
         rid = _latest_run_id(cr_cnx, args.brand)
         if rid is None:
             LOG.info("No runs found to process.")
-            cr_cnx.close()
-            en_cnx.close()
+            cr_cnx.close(); en_cnx.close()
             return 0
         LOG.info(f"Selected latest run_id={rid} (brand={args.brand or 'ALL'})")
         rows = fetch_rows_for_exact_run(cr_cnx, rid, brand_filter=args.brand, limit=limit)
@@ -1087,24 +1082,18 @@ def main():
             except Exception as e:
                 LOG.error(f"[REPAIR] failed for row brand={row.get('brand')} mpn={row.get('part_number')} err={e}")
         LOG.info(f"[REPAIR-SUMMARY] repaired={repaired} requeued_failed={requeued}")
-        try:
-            cr_cnx.close()
-        except Exception:
-            pass
-        try:
-            en_cnx.close()
-        except Exception:
-            pass
+        try: cr_cnx.close()
+        except Exception: pass
+        try: en_cnx.close()
+        except Exception: pass
         return 0
 
-    # Build shared read-only specs cache once (optional optimization)
     global _SPECS_CACHE
     try:
         _SPECS_CACHE = main_client.list_specs()
     except Exception:
         _SPECS_CACHE = None
 
-    # Global upload semaphore
     global _UPLOAD_SEM
     _UPLOAD_SEM = threading.Semaphore(max(1, int(args.upload_parallel)))
 
@@ -1114,20 +1103,16 @@ def main():
     EVERY = max(5, int(args.workers))
     LOG.info(f"[START] workers={args.workers} upload_parallel={args.upload_parallel} rows={len(rows)} brand={args.brand or 'ALL'}")
 
-    # Thread pool over rows
     with ThreadPoolExecutor(max_workers=max(1, int(args.workers)), thread_name_prefix="bridge") as ex:
         futures = [ex.submit(_thread_worker, row, images_folder_id, docs_folder_id, _UPLOAD_SEM, _SPECS_CACHE) for row in rows]
         for fut in as_completed(futures):
             try:
                 ok = fut.result()
-                if ok:
-                    processed += 1
-                else:
-                    failed += 1
+                if ok: processed += 1
+                else:  failed += 1
             except Exception as e:
                 failed += 1
                 LOG.exception(f"[ERROR] worker failed: {e}")
-            # periodic throughput
             done = processed + failed
             if done % EVERY == 0 or done == len(futures):
                 elapsed = max(0.001, time.time() - t0)
@@ -1139,15 +1124,10 @@ def main():
     elapsed = time.time() - t0
     LOG.info(f"[DONE] processed={processed} failed={failed} elapsed={elapsed:.1f}s uploads_total={_UPLOADS_COUNT}")
 
-    # close main-thread connections
-    try:
-        cr_cnx.close()
-    except Exception:
-        pass
-    try:
-        en_cnx.close()
-    except Exception:
-        pass
+    try: cr_cnx.close()
+    except Exception: pass
+    try: en_cnx.close()
+    except Exception: pass
 
     return 1 if failed else 0
 
