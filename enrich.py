@@ -8,6 +8,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Lock, local as thread_local
+import re
 
 from atro_client import AtroClient
 from job_queue import (
@@ -55,6 +56,65 @@ _TLS = thread_local()
 
 # global lock for writing to CSV atomically
 _LOG_LOCK = Lock()
+
+# ---------------------
+# Quality inference helpers
+# ---------------------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_H3_RE = re.compile(r"<\s*h3\b", flags=re.I)
+
+def _strip_html(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return _TAG_RE.sub(" ", s).replace("\xa0", " ").strip()
+
+def _infer_quality(ai: dict) -> str:
+    """
+    Heuristic quality enum based on the generated payload.
+    Returns one of: 'rich', 'sparse', 'unknown'.
+    """
+    try:
+        # Fallback source from enricher is a strong sparse signal
+        if str(ai.get("_source", "")).lower() == "fallback":
+            return "sparse"
+
+        desc_html = ai.get("aiDesc") or ""
+        about_html = ai.get("aboutBrandHtml") or ai.get("aBrandDesc") or ""
+        why_html = ai.get("whyBuyFromUsHtml") or ""
+        specs = ai.get("specs") or {}
+
+        text = _strip_html(desc_html)
+        word_count = len([w for w in text.split() if w])
+        h3_count = len(_H3_RE.findall(desc_html or ""))
+
+        # Count specs heuristically
+        if isinstance(specs, dict):
+            spec_count = len([k for k, v in specs.items() if str(v).strip()])
+        elif isinstance(specs, list):
+            spec_count = len([x for x in specs if str(x).strip()])
+        else:
+            spec_count = 0
+
+        has_brand = bool(_strip_html(about_html))
+        has_why = bool(_strip_html(why_html))
+
+        # Rich if there is substantial body, structure, and supporting blocks
+        if (word_count >= 250 and h3_count >= 2 and (has_brand or has_why)) or word_count >= 450:
+            return "rich"
+
+        # Sparse if too short or unstructured
+        if word_count < 120 or h3_count == 0:
+            return "sparse"
+
+        # If specs are present and body is reasonable, lean rich
+        if word_count >= 220 and spec_count >= 3:
+            return "rich"
+
+        # Otherwise unknown (middle ground)
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 def parse_args():
     p = argparse.ArgumentParser(description="Enrich products into SEOProduct (with provenance/backlog), parallelised")
@@ -220,10 +280,14 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
 
             # Determine quality/refresh + brand backlog signals
             allowed_qualities = {"unknown", "rich", "sparse"}
-            quality = str(ai.get("quality", "unknown")).strip().lower()
-            if quality not in allowed_qualities:
-                quality = "unknown"
-            needs_refresh = 1 if quality == "sparse" else 0
+            q_in = str(ai.get("quality", "") or "").strip().lower()
+            if q_in in allowed_qualities:
+                quality = q_in
+            else:
+                quality = _infer_quality(ai)
+
+            # Treat 'unknown' as in-need-of-refresh for now (unknown OR sparse)
+            needs_refresh = 1 if quality in ("sparse", "unknown") else 0
 
             # updated_via for now mirrors detected content_source (until brand corpus stage)
             updated_via = "supplier" if content_source == "supplier" else "none"
