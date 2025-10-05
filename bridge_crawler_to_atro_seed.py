@@ -110,8 +110,14 @@ def _inc_uploads(n: int = 1):
 
 # --- Product → SEOProduct base field mapping (seed on SEO creation only) ---
 PRODUCT_TO_SEO_FIELD_MAP = {
-    "shortdescription2": "vMShortdescription",
-    "longDescription":   "longDescription",
+    "shortdescription2":    "vMShortdescription",
+    "longDescription":      "longDescription",
+    # NEW: copy additional retailer/VM fields when we first create the SEO record
+    "contentHeader":        "contentHeader",
+    "brandDescription":     "brandDescription",
+    "contentfooter":        "contentfooter",
+    "descriptionpromotion": "descriptionpromotion",
+    "supShortDescription":  "supplierShortDescription",
 }
 
 def _mysql_connect(host, user, password, database):
@@ -1067,7 +1073,7 @@ def main():
         LOG.info(f"Selected ALL latest per (brand, mpn) (brand filter={args.brand or 'ALL'})")
         rows = fetch_latest_crawler_rows(cr_cnx, brand_filter=args.brand, since_run_id=None, limit=limit)
 
-    LOG.info(f"Selected {len(rows)} (brand,mpn) rows from crawler for bridging")
+    LOG.info(f"Selected {len(rows)} (brand, mpn) rows from crawler for bridging")
 
     if args.repair_missed:
         LOG.info(f"[REPAIR] DB-only repair starting for {len(rows)} rows requeue_failed={args.requeue_failed}")

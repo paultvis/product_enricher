@@ -42,6 +42,8 @@ PRODUCT_TO_SEO_FIELD_MAP = {
 AI_FIELD_MAP = {
     "aititle": "aititle",
     "aiDesc": "aiDesc",
+    # Accept either new or legacy key for brand paragraph, map to aBrandDesc
+    "aboutBrandHtml": "aBrandDesc",
     "aBrandDesc": "aBrandDesc",
     "metaName": "metaName",
     "metadescription": "metadescription",
@@ -149,21 +151,54 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
         brand_name = prod.get("brandName")
         content_source = _detect_content_source(prod)
 
+        # Ensure SEO exists (and seed on first create from Product using PRODUCT_TO_SEO_FIELD_MAP)
         seo, created = ensure_seo_for_product(client, prod, PRODUCT_TO_SEO_FIELD_MAP)
 
         if not args.dry_run:
-            # Build AI input
+            # Category for context
             category = None
             cat_names = prod.get("categoriesNames") or {}
             if isinstance(cat_names, dict) and cat_names:
                 category = next(iter(cat_names.values()), None)
 
+            # Pull authoritative SEO fields to feed the model (Route A)
+            seo_fresh = client.find_seo_by_product(
+                prod["id"],
+                select_fields=[
+                    "id",
+                    "brandcontent",
+                    "vMShortdescription",
+                    "contentHeader",
+                    "longDescription",
+                    "brandDescription",
+                    "contentfooter",
+                ],
+            ) or {}
+
+            # Build AI input (SEO first; Product as fallback)
             p_in = {
                 "brand": brand_name,
                 "mpn": prod.get("mpn"),
                 "name": prod.get("name"),
                 "category": category,
-                "base": {k: prod.get(k) for k in PRODUCT_BASE_FIELDS}
+                "base": {
+                    # SEO (authoritative / higher precedence for the prompt)
+                    "brandcontent":       seo_fresh.get("brandcontent"),
+                    "vmshortdescription": seo_fresh.get("vMShortdescription"),
+                    "content_header":     seo_fresh.get("contentHeader"),
+                    "long_description":   seo_fresh.get("longDescription"),
+                    "brand_description":  seo_fresh.get("brandDescription"),
+                    "content_footer":     seo_fresh.get("contentfooter"),
+
+                    # Product fallbacks (used when SEO fields are empty)
+                    "shortdescription2":    prod.get("shortdescription2"),
+                    "contentHeader":        prod.get("contentHeader"),
+                    "longDescription":      prod.get("longDescription"),
+                    "brandDescription":     prod.get("brandDescription"),
+                    "contentfooter":        prod.get("contentfooter"),
+                    "descriptionpromotion": prod.get("descriptionpromotion"),
+                    "supShortDescription":  prod.get("supShortDescription"),
+                }
             }
 
             ai = enrich_product(p_in)
