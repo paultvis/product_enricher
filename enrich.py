@@ -9,13 +9,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Lock, local as thread_local
 import re
+import json
 
 from atro_client import AtroClient
 from job_queue import (
     ensure_tables, fetch_batch, mark_processing, mark_done, mark_failed,
     configure_db, brand_backlog_sparse, brand_backlog_supplier_enriched, note_last_error
 )
-from enricher import enrich_product
+from enricher import enrich_product, _build_messages  # import private helper for payload dump
 from writer import ensure_seo_for_product, patch_ai_fields, upsert_specs_and_values
 
 # --- Product -> SEOProduct base-field mapping (copy on first SEOProduct create)
@@ -116,6 +117,73 @@ def _infer_quality(ai: dict) -> str:
     except Exception:
         return "unknown"
 
+# ---------------------
+# Atro payload normalization
+# ---------------------
+
+def _normalize_ai_for_atro(ai: dict) -> dict:
+    """
+    Normalize model output so Atro receives DB-friendly types.
+    - metakeywords: list -> comma-separated string
+    """
+    out = dict(ai or {})
+    mk = out.get("metakeywords")
+    if isinstance(mk, list):
+        items = [str(x).strip() for x in mk if str(x).strip()]
+        out["metakeywords"] = ", ".join(items) if items else ""
+    elif mk is None:
+        out["metakeywords"] = ""
+    else:
+        out["metakeywords"] = str(mk).strip()
+    return out
+
+# ---------------------
+# Payload dump utilities
+# ---------------------
+
+def _payload_dir_from_args(args) -> str:
+    # CLI flag takes priority; else env; else default next to script
+    cli_dir = getattr(args, "payload_dir", None)
+    if cli_dir:
+        return cli_dir
+    env_dir = os.getenv("PAYLOAD_DUMP_DIR")
+    if env_dir:
+        return env_dir
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "payload_dumps")
+
+def _dump_payload(sku: str, p_in: dict, messages: list, args):
+    """
+    Write p_in and messages to disk; print brief size stats to stderr if --log-errors.
+    """
+    try:
+        out_dir = _payload_dir_from_args(args)
+        os.makedirs(out_dir, exist_ok=True)
+
+        p_in_path = os.path.join(out_dir, f"sku_{sku}__p_in.json")
+        with open(p_in_path, "w", encoding="utf-8") as f:
+            json.dump(p_in, f, ensure_ascii=False, indent=2)
+
+        messages_path = os.path.join(out_dir, f"sku_{sku}__messages.json")
+        with open(messages_path, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+
+        # quick sizes
+        p_in_bytes = len(json.dumps(p_in, ensure_ascii=False))
+        messages_bytes = len(json.dumps(messages, ensure_ascii=False))
+        approx_tokens = int((p_in_bytes + messages_bytes) / 4)  # rough heuristic
+
+        if getattr(args, "log_errors", False):
+            print(
+                f"[PAYLOAD] sku={sku} p_in={p_in_bytes}B messages={messages_bytes}B approx_tokens~{approx_tokens}",
+                file=sys.stderr
+            )
+
+    except Exception as e:
+        # non-fatal
+        if getattr(args, "log_errors", False):
+            print(f"[WARN] Payload dump failed for sku={sku}: {e}", file=sys.stderr)
+
 def parse_args():
     p = argparse.ArgumentParser(description="Enrich products into SEOProduct (with provenance/backlog), parallelised")
     p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "20")))
@@ -125,6 +193,10 @@ def parse_args():
     p.add_argument("--log-errors", action="store_true")
     p.add_argument("--error-log", default=os.getenv("ENRICH_ERROR_LOG", "errors.csv"),
                    help="Path to CSV file for capturing sku+error rows. If relative, it will be created next to this script.")
+    p.add_argument("--dump-payloads", action="store_true",
+                   help="Dump the OpenAI input (p_in + messages) to payload_dumps/ (or --payload-dir).")
+    p.add_argument("--payload-dir", default=None,
+                   help="Directory for payload dumps. Defaults to ./payload_dumps or PAYLOAD_DUMP_DIR.")
     # DB overrides
     p.add_argument("--db-host", default=os.getenv("ENRICH_DB_HOST", "192.168.0.28"))
     p.add_argument("--db-name", default=os.getenv("ENRICH_DB_NAME", "vwr"))
@@ -176,10 +248,9 @@ def _init_error_logger(path: str):
                         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         sku,
                         error_type,
-                        (error_message or "")[:1800]  # keep row reasonable
+                        (error_message or "")[:1800]
                     ])
         except Exception as _e:
-            # Make noise if logging itself fails
             print(f"[WARN] Failed to write error log at {log_path}: {_e}", file=sys.stderr)
 
     return log_path, _log_error_row
@@ -192,7 +263,6 @@ def _get_thread_client(atro_url: str, atro_user: str, atro_pass: str) -> AtroCli
     if client is None:
         client = AtroClient(atro_url, atro_user, atro_pass)
         setattr(_TLS, "client", client)
-        # also cache specs per thread (list is read-only enough for our usage)
         setattr(_TLS, "cached_specs", client.list_specs())
     return client
 
@@ -261,6 +331,14 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
                 }
             }
 
+            # ----- optional payload dump (before calling the API) -----
+            if getattr(args, "dump_payloads", False):
+                try:
+                    messages = _build_messages(p_in)  # exact messages sent inside enricher
+                except Exception:
+                    messages = []
+                _dump_payload(sku, p_in, messages, args)
+
             ai = enrich_product(p_in)
 
             # If the enricher fell back due to API/format errors, log CSV + DB note (non-fatal)
@@ -271,6 +349,9 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
                     note_last_error(sku, err_msg)
                 except Exception:
                     pass
+
+            # Normalize payload so Atro doesn't choke on arrays (metakeywords)
+            ai = _normalize_ai_for_atro(ai)
 
             # Patch AI-only fields
             patch_ai_fields(client, seo["id"], ai, AI_FIELD_MAP)
@@ -289,7 +370,7 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
             # Treat 'unknown' as in-need-of-refresh for now (unknown OR sparse)
             needs_refresh = 1 if quality in ("sparse", "unknown") else 0
 
-            # updated_via for now mirrors detected content_source (until brand corpus stage)
+            # updated_via for now mirrors detected content_source
             updated_via = "supplier" if content_source == "supplier" else "none"
 
             # Brand backlog counters
@@ -318,11 +399,8 @@ def _process_one_sku(sku: str, args, log_error_row, select_fields):
 
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
-        # stderr signal for this SKU
         print(f"[ERROR] SKU {sku}: {msg}", file=sys.stderr)
-        # CSV row
         log_error_row(sku, type(e).__name__, f"{e}\n{traceback.format_exc(limit=3)}")
-        # persist failure message
         try:
             note_last_error(sku, msg)
         except Exception:
@@ -338,19 +416,16 @@ def _auto_workers(n_cli: int) -> int:
         cpu = mp.cpu_count()
     except Exception:
         cpu = 4
-    # IO-bound workload (HTTP + DB): scale above CPU count
     return max(2, min(32, cpu * 4))
 
 def main():
     args = parse_args()
 
-    # Allow raw dump dir to be set here and passed via env (used by enricher)
     raw_dump_dir = os.getenv("RAW_DUMP_DIR")
     if not raw_dump_dir:
         raw_dump_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw_dumps")
         os.environ["RAW_DUMP_DIR"] = raw_dump_dir
 
-    # Configure DB (errors if user/pass missing)
     configure_db(host=args.db_host, user=args.db_user, password=args.db_pass, database=args.db_name)
 
     ensure_tables()
@@ -359,23 +434,19 @@ def main():
         print("No pending SKUs.")
         return 0
 
-    # Mark these SKUs as processing before fanning out
     mark_processing(skus)
 
-    # Prepare error logger
     log_path, log_error_row = _init_error_logger(args.error_log)
     if args.log_errors:
         print(f"[INFO] Error log path: {log_path}", file=sys.stderr)
         print(f"[INFO] Raw dump dir: {raw_dump_dir}", file=sys.stderr)
 
-    # Select fields once (thread-safe constant)
     select_fields = ["sku", "name", "mpn", "brandName", "categoriesNames", "classificationsNames"] + PRODUCT_BASE_FIELDS
 
     workers = _auto_workers(args.workers)
     print(f"Processing {len(skus)} SKUs with {workers} workers...")
 
     processed = failed = 0
-    # Fan out
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="enrich") as ex:
         futures = {ex.submit(_process_one_sku, sku, args, log_error_row, select_fields): sku for sku in skus}
         for i, fut in enumerate(as_completed(futures), start=1):
@@ -397,7 +468,6 @@ def main():
                     pass
                 mark_failed(sku, err)
 
-            # light progress heartbeat every 10 items
             if i % 10 == 0 or i == len(skus):
                 print(f"[PROGRESS] {i}/{len(skus)} processed...")
 
