@@ -49,6 +49,10 @@ Additional polish in this update:
 Repair mode:
 - --repair-missed (DB-only) ensures queue + progress rows even when a prior worker failed mid-run
 - --requeue-failed can flip failed → pending so the enricher will process them
+
+Relink mode (NEW):
+- --relink-missing forces images/docs linking when SEOProduct has no links or clearly fewer links than the crawler currently has,
+  even if the images/docs hashes didn’t change (useful to backfill items that slipped linking in earlier runs)
 """
 #----nudge
 import os
@@ -101,6 +105,9 @@ _SPECS_CACHE: Optional[Dict[str, Any]] = None  # read-only map from Atro (list_s
 # Throughput counters
 _UPLOADS_COUNT = 0
 _UPLOADS_LOCK = threading.Lock()
+
+# Relink toggle (set from CLI)
+RELINK_MISSING = False
 
 def _inc_uploads(n: int = 1):
     global _UPLOADS_COUNT
@@ -173,7 +180,7 @@ def _stable_json_hash(value: Any) -> str:
 def _urls_hash(items: List[Dict[str, Any]], key: str = "url") -> str:
     urls = []
     for it in (items or []):
-        u = (it.get(key) or "").strip()
+        u = (it.get(key) or "").strip() if isinstance(it, dict) else (str(it).strip() if it else "")
         if u:
             urls.append(u)
     urls = sorted(set(urls))
@@ -840,6 +847,29 @@ def process_one(
     do_imgs  = (images_hash is not None) and (images_hash != prog.get("images_hash"))
     do_docs  = (docs_hash is not None) and (docs_hash != prog.get("docs_hash"))
 
+    # --- NEW: Relink-missing mode (force images/docs linking if SEO has too few links)
+    if RELINK_MISSING:
+        linked_file_ids = _get_linked_file_ids_for_seo(client, seo["id"])
+        existing_links_count = len(linked_file_ids)
+        expected_img_count = len([x for x in (current_imgs or []) if x])
+        expected_doc_count = len([x for x in (current_docs or []) if x])
+        expected_total = expected_img_count + expected_doc_count
+
+        if expected_total and existing_links_count == 0:
+            # SEO has no links but crawler has files → force both blocks
+            if expected_img_count:
+                do_imgs = True
+            if expected_doc_count:
+                do_docs = True
+            LOG.info(f"[RELINK] forcing relink: SEO has 0 linked files (expect imgs={expected_img_count} docs={expected_doc_count}) :: sku={sku_for_queue}")
+        elif expected_total and existing_links_count < expected_total:
+            # Not perfect split by type, but run both blocks when clearly short
+            if expected_img_count:
+                do_imgs = True
+            if expected_doc_count:
+                do_docs = True
+            LOG.info(f"[RELINK] forcing relink: SEO has {existing_links_count} links but crawler has {expected_total} (imgs={expected_img_count} docs={expected_doc_count}) :: sku={sku_for_queue}")
+
     # --- NEW: force brand patch when SEO is just created OR when existing SEO has empty brandcontent
     force_brand = False
     if current_brand_html:
@@ -850,7 +880,7 @@ def process_one(
             if not (bc and bc.strip()):
                 force_brand = True
 
-    # ---------- Early exit: if nothing to do (but allow forced brand patch) ----------
+    # ---------- Early exit: if nothing to do (but allow forced actions) ----------
     if not (do_brand or do_specs or do_imgs or do_docs or force_brand):
         LOG.info(f"[SKIP] all unchanged :: sku={sku_for_queue}")
         enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
@@ -888,11 +918,12 @@ def process_one(
         for idx, u in enumerate(current_imgs):
             if not u:
                 continue
-            local = pick_local_jpeg_for_url(crawler_cnx, u.get("url") if isinstance(u, dict) else u)
+            url = u.get("url") if isinstance(u, dict) else u
+            local = pick_local_jpeg_for_url(crawler_cnx, url)
             if not local:
-                LOG.info(f"[SKIP] local image missing :: url={u}")
+                LOG.info(f"[SKIP] local image missing :: url={url}")
                 continue
-            upload_name = _compute_upload_name(local, forced_ext="jpg", original_url=(u.get("url") if isinstance(u, dict) else u))
+            upload_name = _compute_upload_name(local, forced_ext="jpg", original_url=url)
             existing = _find_file_in_folder_by_name(client, images_folder_id, upload_name)
             if existing:
                 file_meta = existing
@@ -921,15 +952,14 @@ def process_one(
         if linked and not seo.get("mainImageId"):
             try:
                 first = current_imgs[0]
-                first_name = _compute_upload_name(
-                    pick_local_jpeg_for_url(crawler_cnx, first.get("url") if isinstance(first, dict) else first),
-                    forced_ext="jpg",
-                    original_url=(first.get("url") if isinstance(first, dict) else first)
-                )
-                main_file = _find_file_in_folder_by_name(client, images_folder_id, first_name)
-                if main_file:
-                    client.set_seo_main_image(seo["id"], main_file["id"])
-                    LOG.info(f"[ATRO] main image set :: seo={seo['id']} file={main_file['id']}")
+                first_url = first.get("url") if isinstance(first, dict) else first
+                first_local = pick_local_jpeg_for_url(crawler_cnx, first_url)
+                if first_local:
+                    first_name = _compute_upload_name(first_local, forced_ext="jpg", original_url=first_url)
+                    main_file = _find_file_in_folder_by_name(client, images_folder_id, first_name)
+                    if main_file:
+                        client.set_seo_main_image(seo["id"], main_file["id"])
+                        LOG.info(f"[ATRO] main image set :: seo={seo['id']} file={main_file['id']}")
             except Exception as e:
                 LOG.warning(f"[WARN] set main image failed :: seo={seo['id']} err={e}")
 
@@ -944,11 +974,12 @@ def process_one(
         for u in current_docs:
             if not u:
                 continue
-            local_pdf = pick_local_pdf_for_url(crawler_cnx, u.get("url") if isinstance(u, dict) else u)
+            url = u.get("url") if isinstance(u, dict) else u
+            local_pdf = pick_local_pdf_for_url(crawler_cnx, url)
             if not local_pdf:
-                LOG.info(f"[SKIP] local PDF missing :: url={u}")
+                LOG.info(f"[SKIP] local PDF missing :: url={url}")
                 continue
-            upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=(u.get("url") if isinstance(u, dict) else u))
+            upload_name = _compute_upload_name(local_pdf, forced_ext="pdf", original_url=url)
             existing = _find_file_in_folder_by_name(client, docs_folder_id, upload_name)
             if existing:
                 file_meta = existing
@@ -1017,6 +1048,8 @@ def _thread_worker(row: Dict[str, Any], images_folder_id: str, docs_folder_id: s
         except Exception: pass
 
 def main():
+    global RELINK_MISSING
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-run-id", type=int, default=None, help="Process rows with run_id >= this value")
     ap.add_argument("--all", action="store_true", help="Process all latest per (brand, mpn)")
@@ -1029,7 +1062,12 @@ def main():
                     help="DB-only pass: ensure queue+progress for selected crawler rows; no Atro calls")
     ap.add_argument("--requeue-failed", action="store_true",
                     help="With --repair-missed: reset status='failed' rows back to 'pending'")
+    # NEW: relink-missing
+    ap.add_argument("--relink-missing", action="store_true",
+                    help="Force relinking files when SEOProduct has no (or fewer) file links, even if hashes didn't change")
     args = ap.parse_args()
+
+    RELINK_MISSING = bool(args.relink_missing)
 
     if args.since_run_id is None and not args.all and not args.latest_run:
         args.latest_run = True
@@ -1049,7 +1087,7 @@ def main():
         cols = set(get_table_columns(en_cnx, EN_NAME, EN_TABLE))
     except Exception:
         cols = set()
-    LOG.info(f"[CAPABILITY] queue_table={EN_TABLE} brand_name_col={'yes' if 'brand_name' in cols else 'no'} progress_table=bridge_progress workers={args.workers} upload_parallel={args.upload_parallel}")
+    LOG.info(f"[CAPABILITY] queue_table={EN_TABLE} brand_name_col={'yes' if 'brand_name' in cols else 'no'} progress_table=bridge_progress workers={args.workers} upload_parallel={args.upload_parallel} relink_missing={RELINK_MISSING}")
 
     images_folder = ensure_folder(main_client, "Product Images")
     docs_folder = ensure_folder(main_client, "Product Documents")
