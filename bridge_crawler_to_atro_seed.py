@@ -852,12 +852,14 @@ def repair_one_row(en_cnx, row: dict, *, requeue_failed: bool=False):
     """
     brand = (row.get("brand") or "").strip()
     mpn   = (row.get("part_number") or "").strip()
-    name  = (row.get("title") or "").strip()
+    name  = 
     # Canonicalise MPN
     canon_mpn, _pn_decision, _pn_conf, _pn_used_title_map = resolve_canonical_mpn(en_cnx, brand, mpn, name)
     if not canon_mpn:
         canon_mpn = mpn
     LOG.info(f"[PN][repair] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
+(row.get("title") or "").strip()
+
     # Resolve SKU
     sku = resolve_or_create_sku(en_cnx, brand, canon_mpn, name or canon_mpn)
 
@@ -997,7 +999,7 @@ def process_one(
     if not canon_mpn:
         canon_mpn = mpn
     LOG.info(f"[PN] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
-    canonical_url = (row.get("product_url") or "").strip()
+canonical_url = (row.get("product_url") or "").strip()
 
     # Ensure Brand
     brand_obj = ensure_brand(client, brand)
@@ -1120,6 +1122,24 @@ def process_one(
             if existing:
                 file_meta = existing
             else:
+                # Prefer a crawler-made JPEG sibling by pretty name if current pick is WEBP/non-JPEG
+                try:
+                    from pathlib import Path as _PathFix
+                    _picked = _PathFix(str(local))
+                    _det_src = _detect_mime_from_magic(_picked)
+                    if str(_picked).lower().endswith(".webp") or _det_src != "image/jpeg":
+                        _img_root = _PathFix(ASSET_ROOT) / "img"
+                        _cands = list(_img_root.rglob(f"*__{upload_name}"))
+                        for _c in _cands:
+                            try:
+                                if _c.exists() and _detect_mime_from_magic(_c) == "image/jpeg":
+                                    LOG.info(f"[IMG] Switching to JPEG sibling by pretty name :: {local} -> {_c}")
+                                    local = _c
+                                    break
+                            except Exception:
+                                continue
+                except Exception as _e:
+                    LOG.warning(f"[IMG] JPEG-sibling scan failed (continuing): {type(_e).__name__}: {_e}")
                 data_url, size, mime_from_writer, _ext_from_writer = writer._to_data_url(local, force_ext="jpg")
                 # Detect true MIME from bytes on disk
                 detected_mime = _detect_mime_from_magic(local)
@@ -1137,7 +1157,7 @@ def process_one(
                 }.get(detected_mime, set())
                 if expected_ext_by_mime and ext_name not in expected_ext_by_mime:
                     LOG.warning(f"[IMG] Name/byte mismatch: ext=.{ext_name} but bytes={detected_mime} :: name={upload_name} path={local}")
-                mime_for_upload = detected_mime
+                mime_for_upload = mime_from_writer
                 if upload_sem:
                     upload_sem.acquire()
                 try:
