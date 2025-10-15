@@ -73,18 +73,23 @@ import requests
 from atro_client import AtroClient
 import writer  # ensure_seo_for_product, upsert_specs_and_values, _to_data_url
 
+LOG = logging.getLogger("bridge")
+LOG.setLevel(logging.INFO)
+_ch = logging.StreamHandler(sys.stdout)
+_ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+LOG.addHandler(_ch)
 
-# --- MIME detection helpers (accurate upload MIME + diagnostics) ---
-from pathlib import Path as _Path
+# ---------- MIME sniff helpers (byte-magic only; surgical addition) ----------
+from pathlib import Path as _PathMime
 
-def _read_head(path: _Path, n: int = 16) -> bytes:
+def _read_head(path: _PathMime, n: int = 16) -> bytes:
     try:
         with open(path, "rb") as f:
             return f.read(n)
     except Exception:
         return b""
 
-def _detect_mime_from_magic(path: _Path) -> str:
+def _detect_mime_from_magic(path: _PathMime) -> str:
     h = _read_head(path, 16)
     # JPEG
     if len(h) >= 3 and h[:3] == b"\xff\xd8\xff":
@@ -98,7 +103,7 @@ def _detect_mime_from_magic(path: _Path) -> str:
     # WEBP: RIFF....WEBP
     if len(h) >= 12 and h[:4] == b"RIFF" and h[8:12] == b"WEBP":
         return "image/webp"
-    # TIFF (both byte orders)
+    # TIFF (II*/MM*)
     if h.startswith(b"II*\x00") or h.startswith(b"MM\x00*"):
         return "image/tiff"
     # BMP
@@ -108,14 +113,7 @@ def _detect_mime_from_magic(path: _Path) -> str:
     return "application/octet-stream"
 
 def _ext_from_name(name: str) -> str:
-    return (_Path(name).suffix or "").lstrip(".").lower()
-
-LOG = logging.getLogger("bridge")
-LOG.setLevel(logging.INFO)
-_ch = logging.StreamHandler(sys.stdout)
-_ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-LOG.addHandler(_ch)
-
+    return (_PathMime(name).suffix or "").lstrip(".").lower()
 # ---------- ENV ----------
 ATRO_BASE_URL = os.getenv("ATRO_BASE_URL", "http://192.168.0.29").strip().rstrip("/")
 ATRO_USER     = os.getenv("ATRO_USER", "pault")
@@ -604,6 +602,153 @@ def _compute_upload_name(local_path: Path, forced_ext: Optional[str], original_u
         pass
     derived = _safe_base_name_from_url(original_url, fallback=local_path.name)
     return _force_ext(derived, forced_ext)
+# ---------- PN canonicalization (brand-only, supplier-agnostic) ----------
+import re as _re_pn
+
+def _norm_title(s: str) -> str:
+    return _re_pn.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _load_brand_rule(cnx, brand: str) -> dict:
+    try:
+        cur = cnx.cursor(dictionary=True)
+        cur.execute("SELECT * FROM pn_rules_brand WHERE brand_name = %s", (brand,))
+        row = cur.fetchone() or {}
+        cur.close()
+        return row
+    except Exception:
+        # table may not exist yet
+        return {}
+
+def _apply_brand_rule(raw_mpn: str, title: str, rule: dict) -> str:
+    mpn = (raw_mpn or "").strip()
+    if not mpn and rule.get("delim_left") and rule.get("delim_right"):
+        t = title or ""
+        try:
+            left = t.split(rule["delim_left"])[-1]
+            mpn = left.split(rule["delim_right"])[0].strip()
+        except Exception:
+            pass
+    if not mpn:
+        return ""
+
+    pref = rule.get("prefix") or ""
+    if pref and mpn.startswith(pref):
+        mpn = mpn[len(pref):]
+
+    srx = rule.get("suffix_regex") or ""
+    if srx:
+        try:
+            mpn = _re_pn.sub(srx, "", mpn, flags=_re_pn.I)
+        except Exception:
+            pass
+
+    rf = rule.get("regex_find") or ""
+    rr = rule.get("regex_replace") or ""
+    if rf:
+        try:
+            mpn = _re_pn.sub(rf, (rr if rr is not None else ""), mpn)
+        except Exception:
+            pass
+
+    p1, c1 = rule.get("stuffone_pos"), rule.get("stuffone_char")
+    p2, c2 = rule.get("stufftwo_pos"), rule.get("stufftwo_char")
+    if isinstance(p1, int) and c1:
+        mpn = (mpn[:p1] + c1 + mpn[p1:])
+    if isinstance(p2, int) and c2:
+        mpn = (mpn[:p2] + c2 + mpn[p2:])
+    return mpn.strip()
+
+def _crosswalk_lookup(cnx, brand: str, alt_mpn: str) -> str:
+    if not alt_mpn:
+        return ""
+    try:
+        cur = cnx.cursor()
+        cur.execute("""
+            SELECT canonical_mpn FROM pn_crosswalk
+            WHERE brand_name=%s AND alt_mpn=%s
+            ORDER BY confidence DESC LIMIT 1
+        """, (brand, alt_mpn))
+        row = cur.fetchone()
+        cur.close()
+        return (row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+def _title_map_lookup(cnx, brand: str, title: str) -> str:
+    t = _norm_title(title)
+    if not t:
+        return ""
+    try:
+        cur = cnx.cursor()
+        cur.execute("""
+            SELECT mapped_mpn FROM pn_title_map
+            WHERE brand_name=%s AND title_norm=%s
+            LIMIT 1
+        """, (brand, t))
+        row = cur.fetchone()
+        cur.close()
+        return (row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+def _nearest_existing_mpn(cnx, brand: str, guess: str) -> str:
+    if not guess:
+        return ""
+    try:
+        cur = cnx.cursor()
+        cur.execute("SELECT manpartno FROM sku WHERE Manufacturer=%s AND manpartno=%s LIMIT 1", (brand, guess))
+        r = cur.fetchone()
+        if r:
+            cur.close()
+            return guess
+        candidates = [guess + "M", guess + "-M", guess + " M", guess + "-", guess.rstrip("- "), guess[:-1] if len(guess) > 1 else guess]
+        qmarks = ",".join(["%s"] * len(candidates))
+        cur.execute(f"SELECT manpartno FROM sku WHERE Manufacturer=%s AND manpartno IN ({qmarks}) LIMIT 1", (brand, *candidates))
+        r2 = cur.fetchone()
+        cur.close()
+        return (r2[0] if r2 else "")
+    except Exception:
+        return ""
+
+def resolve_canonical_mpn(enrich_cnx, brand: str, raw_mpn: str, title: str):
+    """
+    Returns (canonical_mpn, decision, confidence, used_title_map: bool)
+    decision: 'crosswalk'|'rule'|'nearest'|'title_map'|'raw'|'empty'
+    """
+    raw_mpn = (raw_mpn or "").strip()
+
+    cx = _crosswalk_lookup(enrich_cnx, brand, raw_mpn)
+    if cx:
+        return cx, "crosswalk", 100, False
+
+    rule = _load_brand_rule(enrich_cnx, brand)
+    if rule:
+        ruled = _apply_brand_rule(raw_mpn, title, rule)
+        if ruled and ruled != raw_mpn:
+            try:
+                cur = enrich_cnx.cursor()
+                cur.execute("""
+                    INSERT IGNORE INTO pn_crosswalk(brand_name, canonical_mpn, alt_mpn, source, confidence, notes)
+                    VALUES (%s,%s,%s,'rule',95,'brand rule auto')
+                """, (brand, ruled, raw_mpn))
+                enrich_cnx.commit()
+                cur.close()
+            except Exception:
+                pass
+            return ruled, "rule", 95, False
+        if ruled:
+            return ruled, "rule", 90, False
+
+    near = _nearest_existing_mpn(enrich_cnx, brand, raw_mpn)
+    if near:
+        return near, "nearest", 85, False
+
+    tm = _title_map_lookup(enrich_cnx, brand, title)
+    if tm:
+        return tm, "title_map", 90, True
+
+    return (raw_mpn if raw_mpn else ""), ("raw" if raw_mpn else "empty"), (70 if raw_mpn else 0), False
+
 
 # ---------- Enrichment DB helpers ----------
 def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
@@ -707,10 +852,16 @@ def repair_one_row(en_cnx, row: dict, *, requeue_failed: bool=False):
     """
     brand = (row.get("brand") or "").strip()
     mpn   = (row.get("part_number") or "").strip()
-    name  = (row.get("title") or "").strip()
+    name  = 
+    # Canonicalise MPN
+    canon_mpn, _pn_decision, _pn_conf, _pn_used_title_map = resolve_canonical_mpn(en_cnx, brand, mpn, name)
+    if not canon_mpn:
+        canon_mpn = mpn
+    LOG.info(f"[PN][repair] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
+(row.get("title") or "").strip()
 
     # Resolve SKU
-    sku = resolve_or_create_sku(en_cnx, brand, mpn, name or mpn)
+    sku = resolve_or_create_sku(en_cnx, brand, canon_mpn, name or canon_mpn)
 
     # Compute input hashes from crawler fields (same hashing as main path)
     current_brand_html = (row.get("description") or "").strip()
@@ -743,7 +894,7 @@ def repair_one_row(en_cnx, row: dict, *, requeue_failed: bool=False):
 
     # Ensure progress row
     upsert_progress(
-        en_cnx, sku, brand, mpn,
+        en_cnx, sku, brand, canon_mpn,
         brand_html_hash=brand_html_hash,
         specs_hash=specs_hash,
         images_hash=images_hash,
@@ -842,16 +993,22 @@ def process_one(
     brand = (row.get("brand") or "").strip()
     mpn = (row.get("part_number") or "").strip()
     name = (row.get("title") or "").strip()
-    canonical_url = (row.get("product_url") or "").strip()
+    
+    # Canonicalise MPN
+    canon_mpn, _pn_decision, _pn_conf, _pn_used_title_map = resolve_canonical_mpn(enrich_cnx, brand, mpn, name)
+    if not canon_mpn:
+        canon_mpn = mpn
+    LOG.info(f"[PN] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
+canonical_url = (row.get("product_url") or "").strip()
 
     # Ensure Brand
     brand_obj = ensure_brand(client, brand)
 
     # Resolve SKU
-    sku_for_queue = resolve_or_create_sku(enrich_cnx, brand, mpn, name or mpn)
+    sku_for_queue = resolve_or_create_sku(enrich_cnx, brand, canon_mpn, name or canon_mpn)
 
     # Ensure Product
-    product = ensure_product_by_mpn(client, brand_obj, mpn, name, sku_for_queue)
+    product = ensure_product_by_mpn(client, brand_obj, canon_mpn, name, sku_for_queue)
 
     # Ensure SEOProduct (seed with Product short/long on first create)
     seo, created = ensure_seo_for_product_seeded(client, product)
@@ -922,7 +1079,7 @@ def process_one(
         LOG.info(f"[SKIP] all unchanged :: sku={sku_for_queue}")
         enqueue_sku(enrich_cnx, sku_for_queue, brand_name=brand, source="crawler")
         upsert_progress(
-            enrich_cnx, sku_for_queue, brand, mpn,
+            enrich_cnx, sku_for_queue, brand, canon_mpn,
             brand_html_hash=brand_html_hash,
             specs_hash=specs_hash,
             images_hash=images_hash,
@@ -965,49 +1122,40 @@ def process_one(
             if existing:
                 file_meta = existing
             else:
-                
-data_url, size, mime_from_writer, _ext = writer._to_data_url(local, force_ext="jpg")
-
-# Detect real MIME from bytes on disk
-detected_mime = _detect_mime_from_magic(local)
-
-# Extension from upload_name (pretty name)
-ext_name = _ext_from_name(upload_name)
-
-# Diagnostics
-if mime_from_writer != detected_mime:
-    LOG.warning(f"[IMG] MIME mismatch: writer={mime_from_writer}, detected={detected_mime} :: name={upload_name} path={local}")
-
-expected_ext_by_mime = {
-    "image/jpeg": {"jpg", "jpeg"},
-    "image/png": {"png"},
-    "image/gif": {"gif"},
-    "image/webp": {"webp"},
-    "image/tiff": {"tif", "tiff"},
-    "image/bmp": {"bmp"},
-}.get(detected_mime, set())
-
-if expected_ext_by_mime and ext_name not in expected_ext_by_mime:
-    LOG.warning(f"[IMG] Name/byte mismatch: ext=.{ext_name} but bytes={detected_mime} :: name={upload_name} path={local}")
-
-mime_for_upload = detected_mime
-
-if upload_sem:
-    upload_sem.acquire()
-try:
-    file_meta = _upload_with_retries(
-        client,
-        name=upload_name,
-        folder_id=images_folder_id,
-        data_url=data_url,
-        file_size=size,
-        mime_type=mime_for_upload,
-        extension=ext_name or "jpg",
-        tags=f"bridge,crawler,{brand}",
-    )
-finally:
-    if upload_sem:
-        upload_sem.release()
+                data_url, size, mime_from_writer, _ext_from_writer = writer._to_data_url(local, force_ext="jpg")
+                # Detect true MIME from bytes on disk
+                detected_mime = _detect_mime_from_magic(local)
+                ext_name = _ext_from_name(upload_name) or "jpg"
+                # Diagnostics if things disagree
+                if mime_from_writer != detected_mime:
+                    LOG.warning(f"[IMG] MIME mismatch: writer={mime_from_writer}, detected={detected_mime} :: name={upload_name} path={local}")
+                expected_ext_by_mime = {
+                    "image/jpeg": {"jpg", "jpeg"},
+                    "image/png": {"png"},
+                    "image/gif": {"gif"},
+                    "image/webp": {"webp"},
+                    "image/tiff": {"tif", "tiff"},
+                    "image/bmp": {"bmp"},
+                }.get(detected_mime, set())
+                if expected_ext_by_mime and ext_name not in expected_ext_by_mime:
+                    LOG.warning(f"[IMG] Name/byte mismatch: ext=.{ext_name} but bytes={detected_mime} :: name={upload_name} path={local}")
+                mime_for_upload = detected_mime
+                if upload_sem:
+                    upload_sem.acquire()
+                try:
+                    file_meta = _upload_with_retries(
+                        client,
+                        name=upload_name,
+                        folder_id=images_folder_id,
+                        data_url=data_url,
+                        file_size=size,
+                        mime_type=mime_for_upload,
+                        extension=ext_name,
+                        tags=f"bridge,crawler,{brand}",
+                    )
+                finally:
+                    if upload_sem:
+                        upload_sem.release()
 
 
             _safe_link_file_to_seo(client, seo["id"], file_meta["id"], linked_ids)
@@ -1079,7 +1227,7 @@ finally:
 
     # --- Persist progress hashes ---
     upsert_progress(
-        enrich_cnx, sku_for_queue, brand, mpn,
+        enrich_cnx, sku_for_queue, brand, canon_mpn,
         brand_html_hash=brand_html_hash,
         specs_hash=specs_hash,
         images_hash=images_hash,
