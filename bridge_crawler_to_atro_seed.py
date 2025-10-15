@@ -852,14 +852,12 @@ def repair_one_row(en_cnx, row: dict, *, requeue_failed: bool=False):
     """
     brand = (row.get("brand") or "").strip()
     mpn   = (row.get("part_number") or "").strip()
-    name  = 
+    name  = (row.get("title") or "").strip()
     # Canonicalise MPN
     canon_mpn, _pn_decision, _pn_conf, _pn_used_title_map = resolve_canonical_mpn(en_cnx, brand, mpn, name)
     if not canon_mpn:
         canon_mpn = mpn
     LOG.info(f"[PN][repair] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
-(row.get("title") or "").strip()
-
     # Resolve SKU
     sku = resolve_or_create_sku(en_cnx, brand, canon_mpn, name or canon_mpn)
 
@@ -999,7 +997,7 @@ def process_one(
     if not canon_mpn:
         canon_mpn = mpn
     LOG.info(f"[PN] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
-canonical_url = (row.get("product_url") or "").strip()
+    canonical_url = (row.get("product_url") or "").strip()
 
     # Ensure Brand
     brand_obj = ensure_brand(client, brand)
