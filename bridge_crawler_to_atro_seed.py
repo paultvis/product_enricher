@@ -712,45 +712,23 @@ def _nearest_existing_mpn(cnx, brand: str, guess: str) -> str:
 
 def resolve_canonical_mpn(enrich_cnx, brand: str, raw_mpn: str, title: str):
     """
+    Authoritative MPN resolution:
+      - If title_map provides a mapped_mpn, return it EXACTLY (no normalization)
+      - Else if raw_mpn present, return it EXACTLY
+      - Else empty
     Returns (canonical_mpn, decision, confidence, used_title_map: bool)
-    decision: 'crosswalk'|'rule'|'nearest'|'title_map'|'raw'|'empty'
+    decision: 'title_map'|'raw'|'empty'
     """
-    raw_mpn = (raw_mpn or "").strip()
-
-    cx = _crosswalk_lookup(enrich_cnx, brand, raw_mpn)
-    if cx:
-        return cx, "crosswalk", 100, False
-
-    rule = _load_brand_rule(enrich_cnx, brand)
-    if rule:
-        ruled = _apply_brand_rule(raw_mpn, title, rule)
-        if ruled and ruled != raw_mpn:
-            try:
-                cur = enrich_cnx.cursor()
-                cur.execute("""
-                    INSERT IGNORE INTO pn_crosswalk(brand_name, canonical_mpn, alt_mpn, source, confidence, notes)
-                    VALUES (%s,%s,%s,'rule',95,'brand rule auto')
-                """, (brand, ruled, raw_mpn))
-                enrich_cnx.commit()
-                cur.close()
-            except Exception:
-                pass
-            return ruled, "rule", 95, False
-        if ruled:
-            return ruled, "rule", 90, False
-
-    near = _nearest_existing_mpn(enrich_cnx, brand, raw_mpn)
-    if near:
-        return near, "nearest", 85, False
-
+    raw_mpn = (raw_mpn or '').strip()
+    # 1) Title map (exact)
     tm = _title_map_lookup(enrich_cnx, brand, title)
     if tm:
-        return tm, "title_map", 90, True
-
-    return (raw_mpn if raw_mpn else ""), ("raw" if raw_mpn else "empty"), (70 if raw_mpn else 0), False
-
-
-# ---------- Enrichment DB helpers ----------
+        return tm, 'title_map', 100, True
+    # 2) Raw part_number from crawler (exact)
+    if raw_mpn:
+        return raw_mpn, 'raw', 90, False
+    # 3) No MPN
+    return '', 'empty', 0, False
 def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
     cur = cnx.cursor()
 
