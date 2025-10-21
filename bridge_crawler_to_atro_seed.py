@@ -76,7 +76,7 @@ import writer  # ensure_seo_for_product, upsert_specs_and_values, _to_data_url
 LOG = logging.getLogger("bridge")
 LOG.setLevel(logging.INFO)
 _ch = logging.StreamHandler(sys.stdout)
-_ch.setFormatter(logging.Formatter("%(timestamp)s | %(levelname)s | %(message)s".replace("timestamp", "asctime")))
+_ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 LOG.addHandler(_ch)
 
 # ---------- MIME sniff helpers (byte-magic only; surgical addition) ----------
@@ -114,18 +114,6 @@ def _detect_mime_from_magic(path: _PathMime) -> str:
 
 def _ext_from_name(name: str) -> str:
     return (_PathMime(name).suffix or "").lstrip(".").lower()
-
-# ---- brand code helper (normalize to lower; non-alnum → '_') ----
-def _brand_code(name: str) -> str:
-    s = (name or "").strip().lower()
-    res = []
-    for ch in s:
-        res.append(ch if ch.isalnum() else "_")
-    code = "".join(res)
-    while "__" in code:
-        code = code.replace("__", "_")
-    return code.strip("_") or "brand"
-
 # ---------- ENV ----------
 ATRO_BASE_URL = os.getenv("ATRO_BASE_URL", "http://192.168.0.29").strip().rstrip("/")
 ATRO_USER     = os.getenv("ATRO_USER", "pault")
@@ -271,65 +259,34 @@ def upsert_progress(cnx, sku: str, brand: str, mpn: str,
 
 # ---------- Atro helpers ----------
 def ensure_brand(client: AtroClient, brand_name: str) -> Dict[str, Any]:
-    """
-    Ensure a Brand exists by exact name. If multiple exist, return the first result.
-    Always return an active brand; if the existing one is inactive, activate it.
-    If creating, also set 'code' based on normalized name, and set active=true.
-    """
     if not brand_name:
         raise ValueError("brand_name required")
-    name = brand_name.strip()
 
-    # Lookup by exact name
-    try:
-        if hasattr(writer, "urlencode"):
-            q = "?" + writer.urlencode({
-                "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
-                "where[0][type]": "equals",
-                "where[0][attribute]": "name",
-                "where[0][value]": name
-            })
-        else:
-            from urllib.parse import urlencode
-            q = "?" + urlencode({
-                "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
-                "where[0][type]": "equals",
-                "where[0][attribute]": "name",
-                "where[0][value]": name
-            })
-        r = client._request("GET", f"/api/v1/Brand{q}")
-        data = r.json() or {}
-        lst = data.get("list") or []
-    except Exception:
-        lst = []
+    if hasattr(writer, "urlencode"):
+        q = "?" + writer.urlencode({
+            "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
+            "where[0][type]": "equals",
+            "where[0][attribute]": "name",
+            "where[0][value]": brand_name.strip()
+        })
+    else:
+        from urllib.parse import urlencode
+        q = "?" + urlencode({
+            "maxSize": 50, "offset": 0, "sortBy": "name", "asc": "true",
+            "where[0][type]": "equals",
+            "where[0][attribute]": "name",
+            "where[0][value]": brand_name.strip()
+        })
 
+    r = client._request("GET", f"/api/v1/Brand{q}")
+    data = r.json()
+    lst = data.get("list") or []
     if lst:
-        b = lst[0]
-        # Ensure active = true (supports isActive or active)
-        is_active = b.get("isActive") if isinstance(b, dict) else None
-        active2 = b.get("active") if isinstance(b, dict) else None
-        if (is_active is False) or (active2 is False):
-            try:
-                client._request("PATCH", f"/api/v1/Brand/{b['id']}", json={"isActive": True})
-                b["isActive"] = True
-            except Exception:
-                try:
-                    client._request("PATCH", f"/api/v1/Brand/{b['id']}", json={"active": True})
-                    b["active"] = True
-                except Exception:
-                    pass
-        return b
+        return lst[0]
 
-    # Create with code + active
-    payload = {"name": name, "code": _brand_code(name), "isActive": True}
-    try:
-        r = client._request("POST", "/api/v1/Brand", json=payload)
-        return r.json()
-    except Exception:
-        # If 'isActive' is not accepted in this schema, retry with 'active'
-        payload = {"name": name, "code": _brand_code(name), "active": True}
-        r = client._request("POST", "/api/v1/Brand", json=payload)
-        return r.json()
+    payload = {"name": brand_name.strip()}
+    r = client._request("POST", "/api/v1/Brand", json=payload)
+    return r.json()
 
 def ensure_product_by_mpn(
     client: AtroClient,
@@ -340,28 +297,19 @@ def ensure_product_by_mpn(
 ) -> Dict[str, Any]:
     """
     Find Product by MPN; if missing, create minimal Product with sku=sku_preferred (or mpn),
-    mpn=mpn, brandId=brand.id, and ensure product is active.
-    If found but SKU missing, set sku; if found inactive, activate it.
+    mpn=mpn, brandId=brand.id. If found but SKU missing, set sku=sku_preferred (or mpn).
     """
-    prod = client.get_product_by_mpn(mpn, select_fields=["id", "name", "sku", "mpn", "brandId", "isActive", "active"])
+    prod = client.get_product_by_mpn(mpn, select_fields=["id", "name", "sku", "mpn", "brandId"])
     if not prod:
         payload = {
             "name": (name or mpn or "").strip() or mpn,
             "sku": (sku_preferred or mpn),
             "mpn": mpn,
             "brandId": brand["id"],
-            "isActive": True,  # prefer isActive
         }
-        LOG.info(f"[ATRO] Create Product (minimal) :: mpn={mpn} sku={payload['sku']} brand={brand.get('name')} active=True")
-        try:
-            r = client._request("POST", "/api/v1/Product", json=payload)
-            prod = r.json()
-        except Exception:
-            # Fallback if isActive not accepted
-            payload.pop("isActive", None)
-            payload["active"] = True
-            r = client._request("POST", "/api/v1/Product", json=payload)
-            prod = r.json()
+        LOG.info(f"[ATRO] Create Product (minimal) :: mpn={mpn} sku={payload['sku']} brand={brand.get('name')}")
+        r = client._request("PATCH" if False else "POST", "/api/v1/Product", json=payload)
+        prod = r.json()
     else:
         desired_sku = (sku_preferred or prod.get("sku") or "").strip()
         if not (prod.get("sku") or "").strip() and desired_sku:
@@ -369,21 +317,57 @@ def ensure_product_by_mpn(
             client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"sku": desired_sku})
             prod["sku"] = desired_sku
         if not prod.get("brandId") and brand and brand.get("id"):
+    # UI-style GET lookup: contains on mpn (fallback to contains on sku), then prefer exact mpn match
+    prod = None
+    try:
+        from urllib.parse import urlencode
+        q = "?" + urlencode({
+            "select": "id,name,sku,mpn,brandId,isActive,active",
+            "maxSize": 50, "offset": 0, "sortBy": "sku", "asc": "false",
+            "where[0][type]": "contains",
+            "where[0][attribute]": "mpn",
+            "where[0][value]": mpn,
+        })
+        r = client._request("GET", f"/api/v1/Product{q}")
+        data = r.json() or {}
+        lst = data.get("list") or []
+        if lst:
+            for it in lst:
+                if (it.get("mpn") or "") == mpn:
+                    prod = it
+                    break
+            if prod is None:
+                prod = lst[0]
+    except Exception as _e_lookup_mpn:
+        prod = None
+        LOG.warning(f"[ATRO] Product GET by mpn (contains) failed; will try sku fallback/create :: mpn={mpn} err={_e_lookup_mpn}")
+
+    if prod is None:
+        try:
+            from urllib.parse import urlencode
+            q2 = "?" + urlencode({
+                "select": "id,name,sku,mpn,brandId,isActive,active",
+                "maxSize": 50, "offset": 0, "sortBy": "sku", "asc": "false",
+                "where[0][type]": "contains",
+                "where[0][attribute]": "sku",
+                "where[0][value]": mpn,
+            })
+            r2 = client._request("GET", f"/api/v1/Product{q2}")
+            data2 = r2.json() or {}
+            lst2 = data2.get("list") or []
+            if lst2:
+                for it in lst2:
+                    if (it.get("mpn") or "") == mpn or (it.get("sku") or "") == mpn:
+                        prod = it
+                        break
+                if prod is None and lst2:
+                    prod = lst2[0]
+        except Exception as _e_lookup_sku:
+            LOG.warning(f"[ATRO] Product GET by sku (contains) failed; will create :: mpn/sku={mpn} err={_e_lookup_sku}")
+            prod = None
+
             client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"brandId": brand["id"]})
             prod["brandId"] = brand["id"]
-        # Ensure active true if present as false
-        is_active = prod.get("isActive") if isinstance(prod, dict) else None
-        active2 = prod.get("active") if isinstance(prod, dict) else None
-        if (is_active is False) or (active2 is False):
-            try:
-                client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"isActive": True})
-                prod["isActive"] = True
-            except Exception:
-                try:
-                    client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"active": True})
-                    prod["active"] = True
-                except Exception:
-                    pass
     return prod
 
 def ensure_seo_for_product_seeded(client: AtroClient, product: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
@@ -667,7 +651,6 @@ def _compute_upload_name(local_path: Path, forced_ext: Optional[str], original_u
         pass
     derived = _safe_base_name_from_url(original_url, fallback=local_path.name)
     return _force_ext(derived, forced_ext)
-
 # ---------- PN canonicalization (brand-only, supplier-agnostic) ----------
 import re as _re_pn
 
@@ -795,7 +778,6 @@ def resolve_canonical_mpn(enrich_cnx, brand: str, raw_mpn: str, title: str):
         return raw_mpn, 'raw', 90, False
     # 3) No MPN
     return '', 'empty', 0, False
-
 def resolve_or_create_sku(cnx, manufacturer: str, mpn: str, title_or_name: str) -> str:
     cur = cnx.cursor()
 
@@ -1037,20 +1019,20 @@ def process_one(
     mpn = (row.get("part_number") or "").strip()
     name = (row.get("title") or "").strip()
     
-    # Canonicalise MPN (authoritative: title_map → raw)
+    # Canonicalise MPN
     canon_mpn, _pn_decision, _pn_conf, _pn_used_title_map = resolve_canonical_mpn(enrich_cnx, brand, mpn, name)
     if not canon_mpn:
         canon_mpn = mpn
     LOG.info(f"[PN] map :: brand={brand} raw='{mpn}' → canon='{canon_mpn}' via {_pn_decision}({_pn_conf}) title_map={_pn_used_title_map}")
     canonical_url = (row.get("product_url") or "").strip()
 
-    # Ensure Brand (create with code + active; or ensure existing is active)
+    # Ensure Brand
     brand_obj = ensure_brand(client, brand)
 
-    # Resolve/Create SKU (stores exact title when column present)
+    # Resolve SKU
     sku_for_queue = resolve_or_create_sku(enrich_cnx, brand, canon_mpn, name or canon_mpn)
 
-    # Ensure Product (set active on create; ensure active if found inactive)
+    # Ensure Product
     product = ensure_product_by_mpn(client, brand_obj, canon_mpn, name, sku_for_queue)
 
     # Ensure SEOProduct (seed with Product short/long on first create)
