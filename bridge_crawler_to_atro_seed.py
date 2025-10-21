@@ -296,34 +296,20 @@ def ensure_product_by_mpn(
     sku_preferred: Optional[str]
 ) -> Dict[str, Any]:
     """
-    Find Product by MPN; if missing, create minimal Product with sku=sku_preferred (or mpn),
-    mpn=mpn, brandId=brand.id. If found but SKU missing, set sku=sku_preferred (or mpn).
+    Find Product by MPN (UI-style contains filter). If missing, create minimal Product
+    with sku=sku_preferred (or mpn), brandId set, and ensure product is active.
+    If found but SKU missing, set sku; if found inactive, activate it.
     """
-    prod = client.get_product_by_mpn(mpn, select_fields=["id", "name", "sku", "mpn", "brandId"])
-    if not prod:
-        payload = {
-            "name": (name or mpn or "").strip() or mpn,
-            "sku": (sku_preferred or mpn),
-            "mpn": mpn,
-            "brandId": brand["id"],
-        }
-        LOG.info(f"[ATRO] Create Product (minimal) :: mpn={mpn} sku={payload['sku']} brand={brand.get('name')}")
-        r = client._request("PATCH" if False else "POST", "/api/v1/Product", json=payload)
-        prod = r.json()
-    else:
-        desired_sku = (sku_preferred or prod.get("sku") or "").strip()
-        if not (prod.get("sku") or "").strip() and desired_sku:
-            LOG.info(f"[ATRO] Patch Product (set sku) :: id={prod['id']} sku={desired_sku}")
-            client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"sku": desired_sku})
-            prod["sku"] = desired_sku
-        if not prod.get("brandId") and brand and brand.get("id"):
     # UI-style GET lookup: contains on mpn (fallback to contains on sku), then prefer exact mpn match
     prod = None
     try:
         from urllib.parse import urlencode
         q = "?" + urlencode({
             "select": "id,name,sku,mpn,brandId,isActive,active",
-            "maxSize": 50, "offset": 0, "sortBy": "sku", "asc": "false",
+            "maxSize": 50,
+            "offset": 0,
+            "sortBy": "sku",
+            "asc": "false",
             "where[0][type]": "contains",
             "where[0][attribute]": "mpn",
             "where[0][value]": mpn,
@@ -332,6 +318,7 @@ def ensure_product_by_mpn(
         data = r.json() or {}
         lst = data.get("list") or []
         if lst:
+            # Prefer exact mpn match if present
             for it in lst:
                 if (it.get("mpn") or "") == mpn:
                     prod = it
@@ -343,11 +330,15 @@ def ensure_product_by_mpn(
         LOG.warning(f"[ATRO] Product GET by mpn (contains) failed; will try sku fallback/create :: mpn={mpn} err={_e_lookup_mpn}")
 
     if prod is None:
+        # Fallback: contains on sku (since we create as sku=mpn)
         try:
             from urllib.parse import urlencode
             q2 = "?" + urlencode({
                 "select": "id,name,sku,mpn,brandId,isActive,active",
-                "maxSize": 50, "offset": 0, "sortBy": "sku", "asc": "false",
+                "maxSize": 50,
+                "offset": 0,
+                "sortBy": "sku",
+                "asc": "false",
                 "where[0][type]": "contains",
                 "where[0][attribute]": "sku",
                 "where[0][value]": mpn,
@@ -360,14 +351,91 @@ def ensure_product_by_mpn(
                     if (it.get("mpn") or "") == mpn or (it.get("sku") or "") == mpn:
                         prod = it
                         break
-                if prod is None and lst2:
+                if prod is None:
                     prod = lst2[0]
         except Exception as _e_lookup_sku:
             LOG.warning(f"[ATRO] Product GET by sku (contains) failed; will create :: mpn/sku={mpn} err={_e_lookup_sku}")
             prod = None
 
-            client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"brandId": brand["id"]})
+    if not prod:
+        payload = {
+            "name": (name or mpn or "").strip() or mpn,
+            "sku": (sku_preferred or mpn),
+            "mpn": mpn,
+            "brandId": brand["id"],
+            "isActive": True,  # prefer isActive; fallback to 'active' below if needed
+        }
+        LOG.info(f"[ATRO] Create Product (minimal) :: mpn={mpn} sku={payload['sku']} brand={brand.get('name')} active=True")
+        try:
+            r = client._request("POST", "/api/v1/Product", json=payload)
+            # Some Atro setups return non-JSON/empty on create; tolerate and refetch by sku
+            try:
+                prod = r.json()
+            except ValueError:
+                prod = None
+        except Exception:
+            # Fallback if 'isActive' not accepted
+            payload.pop("isActive", None)
+            payload["active"] = True
+            r = client._request("POST", "/api/v1/Product", json=payload)
+            try:
+                prod = r.json()
+            except ValueError:
+                prod = None
+
+        if not prod:
+            # Refetch by sku (contains) to get the created product
+            try:
+                from urllib.parse import urlencode
+                q3 = "?" + urlencode({
+                    "select": "id,name,sku,mpn,brandId,isActive,active",
+                    "maxSize": 50,
+                    "offset": 0,
+                    "sortBy": "sku",
+                    "asc": "false",
+                    "where[0][type]": "contains",
+                    "where[0][attribute]": "sku",
+                    "where[0][value]": (sku_preferred or mpn),
+                })
+                r3 = client._request("GET", f"/api/v1/Product{q3}")
+                data3 = r3.json() or {}
+                lst3 = data3.get("list") or []
+                if lst3:
+                    # Try to pick the exact sku match if present
+                    chosen = None
+                    for it in lst3:
+                        if (it.get("sku") or "") == (sku_preferred or mpn):
+                            chosen = it
+                            break
+                    prod = chosen or lst3[0]
+            except Exception as _e_refetch:
+                LOG.warning(f"[ATRO] Product refetch after create failed :: sku={sku_preferred or mpn} err={_e_refetch}")
+
+    else:
+        desired_sku = (sku_preferred or (prod.get("sku") or "")).strip()
+        if not (prod.get("sku") or "").strip() and desired_sku:
+            LOG.info(f"[ATRO] Patch Product (set sku) :: id={prod['id']} sku={desired_sku}")
+            client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"sku": desired_sku})
+            prod["sku"] = desired_sku
+
+        if not prod.get("brandId") and brand and brand.get("id"):
+            client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"brandId": brand['id']})
             prod["brandId"] = brand["id"]
+
+        # Ensure active if present as false (support both isActive and active)
+        is_active = prod.get("isActive") if isinstance(prod, dict) else None
+        active2 = prod.get("active") if isinstance(prod, dict) else None
+        if (is_active is False) or (active2 is False):
+            try:
+                client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"isActive": True})
+                prod["isActive"] = True
+            except Exception:
+                try:
+                    client._request("PATCH", f"/api/v1/Product/{prod['id']}", json={"active": True})
+                    prod["active"] = True
+                except Exception:
+                    pass
+
     return prod
 
 def ensure_seo_for_product_seeded(client: AtroClient, product: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
